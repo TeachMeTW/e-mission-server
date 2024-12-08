@@ -1,0 +1,6 @@
+data.name,average_reading
+TRIP_SEGMENTATION/segment_into_trips_time/loop,275.8331937849599
+TRIP_SEGMENTATION/create_places_and_trips,6.11492777755484
+TRIP_SEGMENTATION/segment_into_trips_time/has_trip_ended,5.203754482825234
+TRIP_SEGMENTATION/segment_into_trips_dist/has_trip_ended,0.33176563871859305
+TRIP_SEGMENTATION/get_data_df,0.13479221123112303
