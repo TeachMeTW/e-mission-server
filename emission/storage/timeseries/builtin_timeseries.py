@@ -19,7 +19,14 @@ ts_enum_map = {
     esta.EntryType.DATA_TYPE: edb.get_timeseries_db(),
     esta.EntryType.ANALYSIS_TYPE: edb.get_analysis_timeseries_db()
 }
-
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG to capture all levels of logs
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("timeseries_debug.log"),  # Log to a file
+        logging.StreamHandler()  # Also log to the console
+    ]
+)
 INVALID_QUERY = {'metadata.key': 'invalid'}
 
 class BuiltinTimeSeries(esta.TimeSeries):
@@ -264,11 +271,11 @@ class BuiltinTimeSeries(esta.TimeSeries):
         logging.debug("get_entry_at_ts result = %s" % retValue)
         return retValue
 
-    def get_data_df(self, key, time_query = None, geo_query = None,
-                    extra_query_list=None,
-                    map_fn = None):
+    def get_data_df(self, key, time_query=None, geo_query=None,
+                   extra_query_list=None,
+                   map_fn=None):
         """
-        Retuns a dataframe for the specified query.
+        Returns a dataframe for the specified query.
         :param key: the metadata key we are querying for. Only supports one key
         since a dataframe pretty much implies that all entries have the same structure
         :param time_query: the query for the time
@@ -279,31 +286,46 @@ class BuiltinTimeSeries(esta.TimeSeries):
         entry -> dict
         :return:
         """
+        #logging.debug(f"Entering get_data_df with key={key}, time_query={time_query}, geo_query={geo_query}, extra_query_list={extra_query_list}")
         result_it = self.find_entries([key], time_query, geo_query, extra_query_list)
-        return self.to_data_df(key, result_it, map_fn)
+        #logging.debug(f"find_entries returned an iterator")
+        df = self.to_data_df(key, result_it, map_fn)
+        logging.debug(f"get_data_df returning DataFrame with shape {df.shape} and len: {len(df)}")
+        return df
 
     @staticmethod
-    def to_data_df(key, entry_it, map_fn = None):
+    def to_data_df(key, entry_it, map_fn=None):
         """
         Converts the specified iterator into a dataframe
         :param key: The key whose entries are in the iterator
         :param it: The iterator to be converted
         :return: A dataframe composed of the entries in the iterator
         """
+        logging.debug(f"Entering to_data_df with key={key}, map_fn={'provided' if map_fn else 'default'}")
         if map_fn is None:
             map_fn = BuiltinTimeSeries._to_df_entry
+            logging.debug("No map_fn provided; using _to_df_entry")
+        
         # Dataframe doesn't like to work off an iterator - it wants everything in memory
-        df = pd.DataFrame([map_fn(e) for e in entry_it])
-        logging.debug("Found %s results" % len(df))
+        data_list = []
+        for e in entry_it:
+            mapped_entry = map_fn(e)
+            data_list.append(mapped_entry)
+            #logging.debug(f"Mapped entry: {mapped_entry}")
+        df = pd.DataFrame(data_list)
+        logging.debug(f"DataFrame created with {len(df)} rows")
+        
         if len(df) > 0:
             dedup_check_list = [item for item in ecwe.Entry.get_dedup_list(key)
                                 if item in df.columns] + ["metadata_write_ts"]
             numeric_check_list = [col for col in dedup_check_list if df[col].dtype != 'object']
+            logging.debug(f"Deduplication fields: {numeric_check_list}")
             deduped_df = df.drop_duplicates(subset=numeric_check_list)
-            logging.debug("After de-duping, converted %s points to %s " %
-                          (len(df), len(deduped_df)))
+            logging.debug(f"After de-duping, DataFrame has {len(deduped_df)} rows (dropped {len(df) - len(deduped_df)} duplicates)")
         else:
             deduped_df = df
+            logging.debug("DataFrame is empty; skipping deduplication")
+        
         return deduped_df.reset_index(drop=True)
 
 
