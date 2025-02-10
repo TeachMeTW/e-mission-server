@@ -50,8 +50,8 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
     def segment_into_trips(self, timeseries, time_query, filtered_points_df):
         """
         Returns the segmentation points (as start and end point pairs) for a range of data.
-        The logic is the same as before, but much of the per‐row math is done
-        in vectorized numpy calls.
+        This version precomputes the basic differences and also builds a NumPy array of motion
+        timestamps so that we can quickly check for any motion events in a given time interval.
         """
         with ect.Timer() as t_get:
             # Work on a copy with a reset index.
@@ -68,12 +68,17 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         df["valid"] = True
 
         # Retrieve auxiliary data.
-        # IMPORTANT: assign to the instance so that helper methods can access it.
+        # Store transitions on the instance for use in helper functions.
         self.transition_df = timeseries.get_data_df("statemachine/transition", time_query)
-        # Get motion activities as a list so that get_ongoing_motion_in_range works correctly.
+        # Get motion activities as a list (the original functions expect a list of dicts)
         motion_list = list(timeseries.find_entries(["background/motion_activity"], time_query))
+        # Precompute an array of motion timestamps for fast binary search.
+        if motion_list:
+            motion_ts = np.array([m['data']['ts'] for m in motion_list])
+        else:
+            motion_ts = np.array([])
 
-        # Precompute arrays for latitude, longitude, timestamp and metadata_write_ts.
+        # Precompute arrays for latitude, longitude, timestamps, and metadata_write_ts.
         lat = df["latitude"].to_numpy()
         lon = df["longitude"].to_numpy()
         ts = df["ts"].to_numpy()
@@ -83,55 +88,58 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
             return []
 
         # Compute the time gap between consecutive points.
-        delta_time = np.zeros(n)
+        delta_time = np.empty(n)
+        delta_time[0] = 0
         delta_time[1:] = ts[1:] - ts[:-1]
 
         # Compute the distance between consecutive points using our vectorized haversine.
-        delta_distance = np.zeros(n)
+        delta_distance = np.empty(n)
+        delta_distance[0] = 0
         delta_distance[1:] = haversine(lon[:-1], lat[:-1], lon[1:], lat[1:])
 
         # Compute speed (distance per time). Avoid division by zero.
-        speed = np.zeros(n)
+        speed = np.empty(n)
+        speed[0] = 0
         with np.errstate(divide='ignore', invalid='ignore'):
             speed[1:] = np.where(delta_time[1:] > 0, delta_distance[1:] / delta_time[1:], 0)
 
         # For “glomming” points that occur right after a detected trip end,
-        # we use the condition that the gap from the previous point is small.
+        # use the condition that the gap from the previous point is small.
         continue_mask = np.zeros(n, dtype=bool)
         continue_mask[1:] = delta_distance[1:] < self.distance_threshold
 
         segmentation_indices = []
         trip_start_idx = 0
-        just_ended = True  # Begin in the “just ended” state to decide on a start.
+        just_ended = True  # Start in the “just ended” state to decide on a new trip.
         self.last_ts_processed = None
 
         with ect.Timer() as t_loop:
             i = 0
             while i < n:
                 if just_ended:
-                    # When we just ended a trip, some extra points might still be
-                    # part of the previous trip if they are within the distance threshold.
+                    # If the current point is still within the distance threshold of the previous point,
+                    # consider it as part of the previous (just-ended) trip.
                     if i > 0 and continue_mask[i]:
                         self.last_ts_processed = meta_ts[i]
                         i += 1
                         continue
                     else:
-                        # Otherwise, start a new trip here.
+                        # Start a new trip.
                         trip_start_idx = i
                         just_ended = False
                         i += 1
                         continue
                 else:
-                    # In an ongoing trip we compare the current point to the last valid point.
-                    last_valid_idx = i - 1  # normally the previous point is valid.
+                    # In an ongoing trip, compare the current point to the last valid point.
+                    last_valid_idx = i - 1  # Usually the immediately previous point.
                     dt = ts[i] - ts[last_valid_idx]
                     dd = haversine(lon[last_valid_idx], lat[last_valid_idx], lon[i], lat[i])
                     sp = dd / dt if dt > 0 else np.nan
-                    # Compute a speed threshold from the distance and time thresholds.
+                    # Define a speed threshold (for example, 4×distance_threshold over time_threshold).
                     speed_threshold = (4 * self.distance_threshold) / self.time_threshold
 
                     if dt > self.time_threshold:
-                        # (1) If tracking was restarted in this time window, end the trip.
+                        # (1) Check for a tracking restart between last_valid_idx and i.
                         if eaisr.is_tracking_restarted_in_range(ts[last_valid_idx], ts[i],
                                                                  timeseries, self.transition_df):
                             segmentation_indices.append((trip_start_idx, last_valid_idx))
@@ -140,10 +148,16 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                             i += 1
                             continue
 
-                        # (2) If there was no ongoing motion during the gap, end the trip.
-                        ongoing_motion = (len(eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
-                                                                                timeseries, motion_list)) > 0)
-                        if dt > self.time_threshold and (not ongoing_motion):
+                        # (2) Check for ongoing motion in the interval.
+                        # Instead of iterating over the whole motion list, use binary search.
+                        if motion_ts.size > 0:
+                            left = np.searchsorted(motion_ts, ts[last_valid_idx], side='left')
+                            right = np.searchsorted(motion_ts, ts[i], side='right')
+                            has_motion = (right - left) > 0
+                        else:
+                            has_motion = False
+
+                        if dt > self.time_threshold and (not has_motion):
                             segmentation_indices.append((trip_start_idx, last_valid_idx))
                             self.last_ts_processed = meta_ts[i]
                             just_ended = True
@@ -158,13 +172,19 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                             i += 1
                             continue
 
-                        # (4) If we’ve been here a while but haven’t moved much, end the trip.
+                        # (4) If we've been here a while but haven’t moved much, end the trip.
                         if dt > self.time_threshold and sp < speed_threshold:
-                            # Before ending the trip, check for a huge (and invalid) timestamp offset.
+                            # For the huge invalid timestamp offset check, also use binary search
+                            # to extract the motion events in the interval.
+                            if motion_ts.size > 0:
+                                left = np.searchsorted(motion_ts, ts[last_valid_idx], side='left')
+                                right = np.searchsorted(motion_ts, ts[i], side='right')
+                                ongoing_motion_range = motion_list[left:right]
+                            else:
+                                ongoing_motion_range = []
+                            
                             lastPoint = ad.AttrDict(df.loc[last_valid_idx])
                             currPoint = ad.AttrDict(df.loc[i])
-                            ongoing_motion_range = eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
-                                                                                      timeseries, motion_list)
                             if eaistc.is_huge_invalid_ts_offset(self, lastPoint, currPoint,
                                                                 timeseries, ongoing_motion_range):
                                 # Mark this spurious point as invalid.
@@ -178,11 +198,11 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                                 just_ended = True
                                 i += 1
                                 continue
-                    # If none of the above conditions hold, keep going.
+                    # If none of the conditions to end the trip are met, continue with the trip.
                     i += 1
 
-            # Finally, if we ended the loop in an “ongoing trip” state,
-            # we may want to mark the last trip as ended if there is evidence from transitions.
+            # If the loop ends while still in an active trip, check transitions
+            # after the last point to decide whether to end the trip.
             if (not just_ended) and (n > 0):
                 last_point_ts = ts[-1]
                 stopped_moving_after_last = self.transition_df[
