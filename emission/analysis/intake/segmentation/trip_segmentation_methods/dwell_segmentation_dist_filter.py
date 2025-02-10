@@ -20,7 +20,7 @@ import emission.storage.decorations.stats_queries as esds
 import emission.core.timer as ect
 import emission.core.wrapper.pipelinestate as ecwp
 
-# A helper “haversine” function (vectorized) – same as used in the time‐filter.
+# A helper “haversine” function (vectorized)
 def haversine(lon1, lat1, lon2, lat2):
     earth_radius = 6371000  # meters
     lat1, lat2 = np.radians(lat1), np.radians(lat2)
@@ -68,9 +68,10 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         df["valid"] = True
 
         # Retrieve auxiliary data.
-        transition_df = timeseries.get_data_df("statemachine/transition", time_query)
-        # For motion activities we try to get a dataframe (as in the time filter)
-        motion_df = timeseries.get_data_df("background/motion_activity", time_query)
+        # IMPORTANT: assign to the instance so that helper methods can access it.
+        self.transition_df = timeseries.get_data_df("statemachine/transition", time_query)
+        # Get motion activities as a list so that get_ongoing_motion_in_range works correctly.
+        motion_list = list(timeseries.find_entries(["background/motion_activity"], time_query))
 
         # Precompute arrays for latitude, longitude, timestamp and metadata_write_ts.
         lat = df["latitude"].to_numpy()
@@ -101,7 +102,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
 
         segmentation_indices = []
         trip_start_idx = 0
-        just_ended = True  # We begin in the “just ended” state so that we can decide on a start.
+        just_ended = True  # Begin in the “just ended” state to decide on a start.
         self.last_ts_processed = None
 
         with ect.Timer() as t_loop:
@@ -132,7 +133,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                     if dt > self.time_threshold:
                         # (1) If tracking was restarted in this time window, end the trip.
                         if eaisr.is_tracking_restarted_in_range(ts[last_valid_idx], ts[i],
-                                                                 timeseries, transition_df):
+                                                                 timeseries, self.transition_df):
                             segmentation_indices.append((trip_start_idx, last_valid_idx))
                             self.last_ts_processed = meta_ts[i]
                             just_ended = True
@@ -141,7 +142,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
 
                         # (2) If there was no ongoing motion during the gap, end the trip.
                         ongoing_motion = (len(eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
-                                                                                timeseries, motion_df)) > 0)
+                                                                                timeseries, motion_list)) > 0)
                         if dt > self.time_threshold and (not ongoing_motion):
                             segmentation_indices.append((trip_start_idx, last_valid_idx))
                             self.last_ts_processed = meta_ts[i]
@@ -163,9 +164,9 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                             lastPoint = ad.AttrDict(df.loc[last_valid_idx])
                             currPoint = ad.AttrDict(df.loc[i])
                             ongoing_motion_range = eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
-                                                                                      timeseries, motion_df)
+                                                                                      timeseries, motion_list)
                             if eaistc.is_huge_invalid_ts_offset(self, lastPoint, currPoint,
-                                                                 timeseries, ongoing_motion_range):
+                                                                timeseries, ongoing_motion_range):
                                 # Mark this spurious point as invalid.
                                 df.at[i, "valid"] = False
                                 timeseries.invalidate_raw_entry(currPoint["_id"])
@@ -184,8 +185,8 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
             # we may want to mark the last trip as ended if there is evidence from transitions.
             if (not just_ended) and (n > 0):
                 last_point_ts = ts[-1]
-                stopped_moving_after_last = transition_df[
-                    (transition_df.ts > last_point_ts) & (transition_df.transition == 2)
+                stopped_moving_after_last = self.transition_df[
+                    (self.transition_df.ts > last_point_ts) & (self.transition_df.transition == 2)
                 ]
                 if len(stopped_moving_after_last) > 0:
                     segmentation_indices.append((trip_start_idx, n - 1))
