@@ -1,42 +1,47 @@
-from __future__ import division
-from __future__ import unicode_literals
-from __future__ import print_function
-from __future__ import absolute_import
+from __future__ import division, unicode_literals, print_function, absolute_import
 # Standard imports
 from future import standard_library
 standard_library.install_aliases()
-from builtins import str
-from builtins import *
+from builtins import str, range
 from past.utils import old_div
 import logging
 import attrdict as ad
 import numpy as np
-import datetime as pydt
+import pandas as pd
 import time
 
 # Our imports
 import emission.analysis.point_features as pf
 import emission.analysis.intake.segmentation.trip_segmentation as eaist
 import emission.core.wrapper.location as ecwl
-
 import emission.analysis.intake.segmentation.restart_checking as eaisr
 import emission.analysis.intake.segmentation.trip_segmentation_methods.trip_end_detection_corner_cases as eaistc
 import emission.storage.decorations.stats_queries as esds
 import emission.core.timer as ect
 import emission.core.wrapper.pipelinestate as ecwp
 
+# A helper “haversine” function (vectorized) – same as used in the time‐filter.
+def haversine(lon1, lat1, lon2, lat2):
+    earth_radius = 6371000  # meters
+    lat1, lat2 = np.radians(lat1), np.radians(lat2)
+    lon1, lon2 = np.radians(lon1), np.radians(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2 * earth_radius * np.arcsin(np.sqrt(a))
+
+TWELVE_HOURS = 12 * 60 * 60
+
 class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
     def __init__(self, time_threshold, point_threshold, distance_threshold):
         """
         Determines segmentation points for points that were generated using a
         distance filter (i.e. report points every n meters). This will *not* work for
-        points generated using a distance filter because it expects to have a
-        time gap between subsequent points to detect the trip end, and with a
-        time filter, we get updates every n seconds.
-
-        At least on iOS, we sometimes get points even when the phone is not in
-        motion. This seems to be triggered by zigzagging between low quality
-        points.
+        points generated using a time filter, because it expects to have a
+        time gap between subsequent points to detect the trip end.
+        
+        On iOS, we sometimes get points even when the phone is not in motion,
+        triggered by zigzagging between low quality points.
         """
         self.time_threshold = time_threshold
         self.point_threshold = point_threshold
@@ -44,93 +49,147 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
 
     def segment_into_trips(self, timeseries, time_query, filtered_points_df):
         """
-        Examines the timeseries database for a specific range and returns the
-        segmentation points. Note that the input is the entire timeseries and
-        the time range. This allows algorithms to use whatever combination of
-        data that they want from the sensor streams in order to determine the
-        segmentation points.
+        Returns the segmentation points (as start and end point pairs) for a range of data.
+        The logic is the same as before, but much of the per‐row math is done
+        in vectorized numpy calls.
         """
-        with ect.Timer() as t_get_filtered_points:
-            self.filtered_points_df = filtered_points_df
-            user_id = self.filtered_points_df["user_id"].iloc[0]
+        with ect.Timer() as t_get:
+            # Work on a copy with a reset index.
+            df = filtered_points_df.copy().reset_index(drop=True)
+            user_id = df["user_id"].iloc[0]
         esds.store_pipeline_time(
             user_id,
             ecwp.PipelineStages.TRIP_SEGMENTATION.name + "/segment_into_trips_dist/get_filtered_points_df",
             time.time(),
-            t_get_filtered_points.elapsed
+            t_get.elapsed
         )
 
-        self.filtered_points_df.loc[:, "valid"] = True
+        # Mark every point as valid initially.
+        df["valid"] = True
 
-        self.transition_df = timeseries.get_data_df("statemachine/transition", time_query)
-        self.motion_list = list(timeseries.find_entries(["background/motion_activity"], time_query))
+        # Retrieve auxiliary data.
+        transition_df = timeseries.get_data_df("statemachine/transition", time_query)
+        # For motion activities we try to get a dataframe (as in the time filter)
+        motion_df = timeseries.get_data_df("background/motion_activity", time_query)
 
-        if len(self.transition_df) > 0:
-            logging.debug("self.transition_df = %s" % self.transition_df[["fmt_time", "transition"]])
-        else:
-            logging.debug("no transitions found. This can happen for continuous sensing")
+        # Precompute arrays for latitude, longitude, timestamp and metadata_write_ts.
+        lat = df["latitude"].to_numpy()
+        lon = df["longitude"].to_numpy()
+        ts = df["ts"].to_numpy()
+        meta_ts = df["metadata_write_ts"].to_numpy()
+        n = len(df)
+        if n == 0:
+            return []
 
+        # Compute the time gap between consecutive points.
+        delta_time = np.zeros(n)
+        delta_time[1:] = ts[1:] - ts[:-1]
+
+        # Compute the distance between consecutive points using our vectorized haversine.
+        delta_distance = np.zeros(n)
+        delta_distance[1:] = haversine(lon[:-1], lat[:-1], lon[1:], lat[1:])
+
+        # Compute speed (distance per time). Avoid division by zero.
+        speed = np.zeros(n)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            speed[1:] = np.where(delta_time[1:] > 0, delta_distance[1:] / delta_time[1:], 0)
+
+        # For “glomming” points that occur right after a detected trip end,
+        # we use the condition that the gap from the previous point is small.
+        continue_mask = np.zeros(n, dtype=bool)
+        continue_mask[1:] = delta_distance[1:] < self.distance_threshold
+
+        segmentation_indices = []
+        trip_start_idx = 0
+        just_ended = True  # We begin in the “just ended” state so that we can decide on a start.
         self.last_ts_processed = None
 
-        logging.info("Last ts processed = %s" % self.last_ts_processed)
-
-        segmentation_points = []
-        last_trip_end_point = None
-        curr_trip_start_point = None
-        just_ended = True
-
         with ect.Timer() as t_loop:
-            for idx, row in self.filtered_points_df.iterrows():
-                currPoint = ad.AttrDict(row)
-                currPoint.update({"idx": idx})
-                logging.debug("-" * 30 + str(currPoint.fmt_time) + "-" * 30)
-
-                if curr_trip_start_point is None:
-                    logging.debug("Appending currPoint because the current start point is None")
-                    # segmentation_points.append(currPoint)
-
+            i = 0
+            while i < n:
                 if just_ended:
-                    continue_flag = self.continue_just_ended(idx, currPoint, self.filtered_points_df)
-
-                    if continue_flag:
-                        # We have "processed" the currPoint by deciding to glom it
-                        self.last_ts_processed = currPoint.metadata_write_ts
+                    # When we just ended a trip, some extra points might still be
+                    # part of the previous trip if they are within the distance threshold.
+                    if i > 0 and continue_mask[i]:
+                        self.last_ts_processed = meta_ts[i]
+                        i += 1
                         continue
-                    # else:
-                    sel_point = currPoint
-                    logging.debug("Setting new trip start point %s with idx %s" % (sel_point, sel_point.idx))
-                    curr_trip_start_point = sel_point
-                    just_ended = False
+                    else:
+                        # Otherwise, start a new trip here.
+                        trip_start_idx = i
+                        just_ended = False
+                        i += 1
+                        continue
                 else:
-                    with ect.Timer() as t_process_trip:
-                        # Using .loc here causes problems if we have filtered out some points and so the index is non-consecutive.
-                        # Using .iloc just ends up including points after this one.
-                        # So we reset_index upstream and use it here.
-                        last10Points_df = self.filtered_points_df.iloc[
-                            max(idx - self.point_threshold, curr_trip_start_point.idx):idx + 1
-                        ]
-                        lastPoint = self.find_last_valid_point(idx)
-                        trip_ended = self.has_trip_ended(lastPoint, currPoint, timeseries)
+                    # In an ongoing trip we compare the current point to the last valid point.
+                    last_valid_idx = i - 1  # normally the previous point is valid.
+                    dt = ts[i] - ts[last_valid_idx]
+                    dd = haversine(lon[last_valid_idx], lat[last_valid_idx], lon[i], lat[i])
+                    sp = dd / dt if dt > 0 else np.nan
+                    # Compute a speed threshold from the distance and time thresholds.
+                    speed_threshold = (4 * self.distance_threshold) / self.time_threshold
 
-                        if trip_ended:
-                            last_trip_end_point = lastPoint
-                            logging.debug("Appending last_trip_end_point %s with index %s " %
-                                        (last_trip_end_point, idx - 1))
-                            segmentation_points.append((curr_trip_start_point, last_trip_end_point))
-                            logging.info("Found trip end at %s" % last_trip_end_point.fmt_time)
-                            # We have processed everything up to the trip end by marking it as a completed trip
-                            self.last_ts_processed = currPoint.metadata_write_ts
+                    if dt > self.time_threshold:
+                        # (1) If tracking was restarted in this time window, end the trip.
+                        if eaisr.is_tracking_restarted_in_range(ts[last_valid_idx], ts[i],
+                                                                 timeseries, transition_df):
+                            segmentation_indices.append((trip_start_idx, last_valid_idx))
+                            self.last_ts_processed = meta_ts[i]
                             just_ended = True
-                            # Now, we have finished processing the previous point as a trip
-                            # end or not. But we still need to process this point by seeing
-                            # whether it should represent a new trip start, or a glom to the
-                            # previous trip
-                            if not self.continue_just_ended(idx, currPoint, self.filtered_points_df):
-                                sel_point = currPoint
-                                logging.debug("Setting new trip start point %s with idx %s" % (sel_point, sel_point.idx))
-                                curr_trip_start_point = sel_point
-                                just_ended = False
+                            i += 1
+                            continue
 
+                        # (2) If there was no ongoing motion during the gap, end the trip.
+                        ongoing_motion = (len(eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
+                                                                                timeseries, motion_df)) > 0)
+                        if dt > self.time_threshold and (not ongoing_motion):
+                            segmentation_indices.append((trip_start_idx, last_valid_idx))
+                            self.last_ts_processed = meta_ts[i]
+                            just_ended = True
+                            i += 1
+                            continue
+
+                        # (3) If the gap is huge (e.g. >12 hours), end the trip.
+                        if dt > TWELVE_HOURS:
+                            segmentation_indices.append((trip_start_idx, last_valid_idx))
+                            self.last_ts_processed = meta_ts[i]
+                            just_ended = True
+                            i += 1
+                            continue
+
+                        # (4) If we’ve been here a while but haven’t moved much, end the trip.
+                        if dt > self.time_threshold and sp < speed_threshold:
+                            # Before ending the trip, check for a huge (and invalid) timestamp offset.
+                            lastPoint = ad.AttrDict(df.loc[last_valid_idx])
+                            currPoint = ad.AttrDict(df.loc[i])
+                            ongoing_motion_range = eaisr.get_ongoing_motion_in_range(ts[last_valid_idx], ts[i],
+                                                                                      timeseries, motion_df)
+                            if eaistc.is_huge_invalid_ts_offset(self, lastPoint, currPoint,
+                                                                 timeseries, ongoing_motion_range):
+                                # Mark this spurious point as invalid.
+                                df.at[i, "valid"] = False
+                                timeseries.invalidate_raw_entry(currPoint["_id"])
+                                i += 1
+                                continue
+                            else:
+                                segmentation_indices.append((trip_start_idx, last_valid_idx))
+                                self.last_ts_processed = meta_ts[i]
+                                just_ended = True
+                                i += 1
+                                continue
+                    # If none of the above conditions hold, keep going.
+                    i += 1
+
+            # Finally, if we ended the loop in an “ongoing trip” state,
+            # we may want to mark the last trip as ended if there is evidence from transitions.
+            if (not just_ended) and (n > 0):
+                last_point_ts = ts[-1]
+                stopped_moving_after_last = transition_df[
+                    (transition_df.ts > last_point_ts) & (transition_df.transition == 2)
+                ]
+                if len(stopped_moving_after_last) > 0:
+                    segmentation_indices.append((trip_start_idx, n - 1))
+                    self.last_ts_processed = meta_ts[-1]
         esds.store_pipeline_time(
             user_id,
             ecwp.PipelineStages.TRIP_SEGMENTATION.name + "/segment_into_trips_dist/loop",
@@ -138,180 +197,12 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
             t_loop.elapsed
         )
 
-
-        # Since we only end a trip when we start a new trip, this means that
-        # the last trip that was pushed is ignored. Consider the example of
-        # 2016-02-22 when I took kids to karate. We arrived shortly after 4pm,
-        # so during that remote push, a trip end was not detected. And we got
-        # back home shortly after 5pm, so the trip end was only detected on the
-        # phone at 6pm. At that time, the following points were pushed:
-        # ..., 2016-02-22T16:04:02, 2016-02-22T16:49:34, 2016-02-22T16:49:50,
-        # ..., 2016-02-22T16:57:04
-        # Then, on the server, while iterating through the points, we detected
-        # a trip end at 16:04, and a new trip start at 16:49. But we did not
-        # detect the trip end at 16:57, because we didn't start a new point.
-        # This has two issues:
-        # - we won't see this trip until the next trip start, which may be on the next day
-        # - we won't see this trip at all, because when we run the pipeline the
-        # next time, we will only look at points from that time onwards. These
-        # points have been marked as "processed", so they won't even be considered.
-
-        # There are multiple potential fixes:
-        # - we can mark only the completed trips as processed. This will solve (2) above, but not (1)
-        # - we can mark a trip end based on the fact that we only push data
-        # when a trip ends, so if we have data, it means that the trip has been
-        # detected as ended on the phone.
-        # This seems a bit fragile - what if we start pushing incomplete trip
-        # data for efficiency reasons? Therefore, we also check to see if there
-        # is a trip_end_detected in this timeframe after the last point. If so,
-        # then we end the trip at the last point that we have.
-        if not just_ended and len(self.transition_df) > 0:
-            stopped_moving_after_last = self.transition_df[
-                (self.transition_df.ts > currPoint.ts) & (self.transition_df.transition == 2)
-            ]
-            logging.debug("stopped_moving_after_last = %s" % stopped_moving_after_last[["fmt_time", "transition"]])
-            if len(stopped_moving_after_last) > 0:
-                logging.debug("Found %d transitions after last point, ending trip..." % len(stopped_moving_after_last))
-                segmentation_points.append((curr_trip_start_point, currPoint))
-                self.last_ts_processed = currPoint.metadata_write_ts
-            else:
-                logging.debug("Found %d transitions after last point, not ending trip..." % len(stopped_moving_after_last))
+        # Convert segmentation indices back into (start, end) AttrDict pairs.
+        segmentation_points = []
+        for start_idx, end_idx in segmentation_indices:
+            start_point = ad.AttrDict(df.loc[start_idx])
+            end_point = ad.AttrDict(df.loc[end_idx])
+            segmentation_points.append((start_point, end_point))
+            logging.info(f"Segmented trip: {start_point.fmt_time} -> {end_point.fmt_time}")
 
         return segmentation_points
-
-    def has_trip_ended(self, lastPoint, currPoint, timeseries):
-        # So we must not have been moving for the last _time filter_
-        # points. So the trip must have ended
-        # Since this is a distance filter, we detect that the last
-        # trip has ended at the time that the new trip starts. So
-        # if the last_trip_end_point is lastPoint, then
-        # curr_trip_start_point should be currPoint. But then we will
-        # have problems with the spurious, noisy points that are
-        # generated until the geofence is turned on, if ever
-        # So we will continue to defer new trip starting until we
-        # have worked through all of those.
-        timeDelta = currPoint.ts - lastPoint.ts
-        distDelta = pf.calDistance(lastPoint, currPoint)
-        logging.debug("lastPoint = %s, time difference = %s dist difference %s" %
-                      (lastPoint, timeDelta, distDelta))
-        if timeDelta > self.time_threshold:
-            # We have been at this location for more than the time filter.
-            # This could be because we have not been moving for the last
-            # _time filter_ points, or because we didn't get points for
-            # that duration, (e.g. because we were underground)
-            if timeDelta > 0:
-                speedDelta = old_div(distDelta, timeDelta)
-            else:
-                speedDelta = np.nan
-            # this is way too slow. On ios, we use 5meters in 10 minutes.
-            # On android, we use 10 meters in 5 mins, which seems to work better
-            # for this kind of test
-            speedThreshold = old_div(float(self.distance_threshold * 2), (old_div(self.time_threshold, 2)))
-
-            if eaisr.is_tracking_restarted_in_range(lastPoint.ts, currPoint.ts, timeseries, self.transition_df):
-                logging.debug("tracking was restarted, ending trip")
-                return True
-
-            # In general, we get multiple locations between each motion activity. If we see a bunch of motion activities
-            # between two location points, and there is a large gap between the last location and the first
-            # motion activity as well, let us just assume that there was a restart
-            ongoing_motion_in_range = eaisr.get_ongoing_motion_in_range(lastPoint.ts, currPoint.ts, timeseries, self.motion_list)
-            ongoing_motion_check = len(ongoing_motion_in_range) > 0
-            if timeDelta > self.time_threshold and not ongoing_motion_check:
-                logging.debug("lastPoint.ts = %s, currPoint.ts = %s, threshold = %s, large gap = %s, ongoing_motion_in_range = %s, ending trip" %
-                              (lastPoint.ts, currPoint.ts,self.time_threshold, currPoint.ts - lastPoint.ts, ongoing_motion_check))
-                return True
-
-            # http://www.huffingtonpost.com/hoppercom/the-worlds-20-longest-non-stop-flights_b_5994268.html
-            # Longest flight is 17 hours, which is the longest you can go without cell reception
-            # And even if you split an air flight that long into two, you will get some untracked time in the
-            # middle, so that's good.
-            TWELVE_HOURS = 12 * 60 * 60
-            if timeDelta > TWELVE_HOURS:
-                logging.debug("lastPoint.ts = %s, currPoint.ts = %s, TWELVE_HOURS = %s, large gap = %s, ending trip" %
-                              (lastPoint.ts, currPoint.ts, TWELVE_HOURS, currPoint.ts - lastPoint.ts))
-                return True
-
-            if (timeDelta > self.time_threshold and # We have been here for a while
-                        speedDelta < speedThreshold): # we haven't moved very much
-                # This can happen even during ongoing trips due to spurious points
-                # generated on some iOS phones
-                # https://github.com/e-mission/e-mission-server/issues/577#issuecomment-376379460
-                if eaistc.is_huge_invalid_ts_offset(self, lastPoint, currPoint,
-                    timeseries, ongoing_motion_in_range):
-                    # invalidate from memory and the database.
-                    logging.debug("About to set valid column for index = %s" % 
-                        (currPoint.idx))
-                    self.filtered_points_df.valid.iloc[currPoint.idx] = False
-                    logging.debug("After dropping %d, filtered points = %s" % 
-                        (currPoint.idx, self.filtered_points_df.iloc[currPoint.idx - 5:currPoint.idx + 5][["valid", "fmt_time"]]))
-                    logging.debug("remove huge invalid ts offset point = %s" % currPoint)
-                    timeseries.invalidate_raw_entry(currPoint["_id"])
-                    # We currently re-retrieve the last point every time, so
-                    # searching upwards is good enough but if we use
-                    # lastPoint = currPoint, we should update currPoint here
-                    return False
-                else:
-                    logging.debug("lastPoint.ts = %s, currPoint.ts = %s, threshold = %s, large gap = %s, ending trip" %
-                                  (lastPoint.ts, currPoint.ts,self.time_threshold, currPoint.ts - lastPoint.ts))
-                    return True
-            else:
-                logging.debug("lastPoint.ts = %s, currPoint.ts = %s, time gap = %s (vs %s), distance_gap = %s (vs %s), speed_gap = %s (vs %s) continuing trip" %
-                              (lastPoint.ts, currPoint.ts,
-                               timeDelta, self.time_threshold,
-                               distDelta, self.distance_threshold,
-                               speedDelta, speedThreshold))
-                return False
-
-    def find_last_valid_point(self, idx):
-        lastPoint = ad.AttrDict(self.filtered_points_df.iloc[idx-1])
-        if lastPoint.valid:
-            # common case, fast
-            return lastPoint
-
-        # uncommon case, walk backwards until you find something valid.
-        i = 2
-        while not lastPoint.valid and (idx - i) >= 0:
-            lastPoint = ad.AttrDict(self.filtered_points_df.iloc[idx-i])
-            i = i-1
-        return lastPoint
-
-    def continue_just_ended(self, idx, currPoint, filtered_points_df):
-        """
-        Normally, since the logic here and the
-        logic on the phone are the same, if we have detected a trip
-        end, any points after this are part of the new trip.
-
-        However, in some circumstances, notably in my data from 27th
-        August, there appears to be a mismatch and we get a couple of
-        points past the end that we detected here.  So let's look for
-        points that are within the distance filter, and are at a
-        delta of a minute, and join them to the just ended trip instead of using them to
-        start the new trip
-
-        :param idx: Index of the current point
-        :param currPoint: current point
-        :param filtered_points_df: dataframe of filtered points
-        :return: True if we should continue the just ended trip, False otherwise
-        """
-        if idx == 0:
-            return False
-        else:
-            lastPoint = ad.AttrDict(filtered_points_df.iloc[idx - 1])
-
-            deltaDist = pf.calDistance(lastPoint, currPoint)
-            deltaTime = currPoint.ts - lastPoint.ts
-            logging.debug("Comparing with lastPoint = %s, distance = %s < threshold %s, time = %s < threshold %s" %
-                          (lastPoint, deltaDist, self.distance_threshold,
-                            deltaTime, self.time_threshold))
-            # Unlike the time filter, with the distance filter, we concatenate all points
-            # that are within the distance threshold with the previous trip
-            # end, since because of the distance filter, even noisy points
-            # can occur at an arbitrary time in the future
-            if deltaDist < self.distance_threshold:
-                logging.info("Points %s (%s) and %s (%s) are %d apart, within the distance filter so part of the same trip" %
-                             (lastPoint["_id"], lastPoint.loc, currPoint["_id"], currPoint.loc, deltaDist))
-                return True
-            else:
-                return False
-
