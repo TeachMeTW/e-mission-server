@@ -30,21 +30,21 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         self.time_threshold = time_threshold
         self.point_threshold = point_threshold
         self.distance_threshold = distance_threshold
+        # Pre-compute approximate speed threshold:
+        # speedThreshold = (distance_threshold * 2) / (time_threshold/2) = 4 * distance_threshold / time_threshold
+        self.speedThreshold = 4.0 * self.distance_threshold / self.time_threshold
 
     def segment_into_trips(self, timeseries, time_query, filtered_points_df):
         """
-        Process the filtered points (which are assumed to have been generated
-        using a distance filter) and return a list of (trip_start, trip_end)
-        segmentation tuples. In this optimized version we “chunk” the points
-        into segments rather than iterating one-by-one.
+        Process the filtered points (assumed to be generated using a distance filter)
+        and return a list of (trip_start, trip_end) segmentation tuples.
         """
         with ect.Timer() as t_get_filtered_points:
             self.filtered_points_df = filtered_points_df
             user_id = self.filtered_points_df["user_id"].iloc[0]
         esds.store_pipeline_time(
             user_id,
-            ecwp.PipelineStages.TRIP_SEGMENTATION.name +
-            "/segment_into_trips_dist/get_filtered_points_df",
+            ecwp.PipelineStages.TRIP_SEGMENTATION.name + "/segment_into_trips_dist/get_filtered_points_df",
             time.time(),
             t_get_filtered_points.elapsed
         )
@@ -52,7 +52,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         # Mark all points as valid initially.
         self.filtered_points_df.loc[:, "valid"] = True
 
-        # Retrieve the state machine transitions and motion activities.
+        # Retrieve state machine transitions and motion activities.
         self.transition_df = timeseries.get_data_df("statemachine/transition", time_query)
         self.motion_list = list(timeseries.find_entries(["background/motion_activity"], time_query))
         if len(self.transition_df) > 0:
@@ -64,39 +64,36 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         self.last_ts_processed = None
         logging.info("Last ts processed = %s", self.last_ts_processed)
 
-        n_points = len(self.filtered_points_df)
+        df = self.filtered_points_df  # local alias for speed
+        n_points = len(df)
         i = 0
-        # 'just_ended' indicates that we have just ended a trip, so that subsequent
-        # points may need to be “glommed” with the previous trip.
         just_ended = True
         curr_trip_start_point = None
 
         with ect.Timer() as t_loop:
             while i < n_points:
-                # Get the current point and add its index (needed in helper functions)
-                currPoint = ad.AttrDict(self.filtered_points_df.iloc[i])
+                currPoint = ad.AttrDict(df.iloc[i])
                 currPoint.idx = i
                 logging.debug("Processing point idx=%s, time=%s", i, currPoint.fmt_time)
 
                 if just_ended:
-                    # On a new segment, check whether we need to “continue” the just-ended trip.
-                    if self.continue_just_ended(i, currPoint, self.filtered_points_df):
+                    # Check whether the current point should merge with the previous trip.
+                    if self.continue_just_ended(i, currPoint, df):
                         self.last_ts_processed = currPoint.metadata_write_ts
                         i += 1
                         continue
                     else:
-                        # Start a new trip segment here.
+                        # Start a new trip segment.
                         curr_trip_start_point = currPoint
                         just_ended = False
                         i += 1
                         continue
 
-                # We are inside a trip segment; now scan ahead until a trip end is detected.
+                # We are inside an ongoing trip; scan ahead until a trip end is detected.
                 trip_ended = False
                 j = i
-                last_valid_point = None
                 while j < n_points and not trip_ended:
-                    currPoint = ad.AttrDict(self.filtered_points_df.iloc[j])
+                    currPoint = ad.AttrDict(df.iloc[j])
                     currPoint.idx = j
                     last_valid_point = self.find_last_valid_point(j)
                     if self.has_trip_ended(last_valid_point, currPoint, timeseries):
@@ -106,34 +103,30 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
 
                 if trip_ended:
                     # End the current trip segment at the last valid point.
-                    segmentation_points.append((curr_trip_start_point, last_valid_point))
-                    logging.info("Found trip end at %s", last_valid_point.fmt_time)
+                    final_valid = self.find_last_valid_point(j)
+                    segmentation_points.append((curr_trip_start_point, final_valid))
+                    logging.info("Found trip end at %s", final_valid.fmt_time)
                     self.last_ts_processed = currPoint.metadata_write_ts
                     just_ended = True
-                    # It is possible that the current point (where the gap was detected)
-                    # should also start a new trip (or be merged with the previous trip)
-                    if not self.continue_just_ended(j, currPoint, self.filtered_points_df):
+                    # Possibly start a new trip from the current point.
+                    if not self.continue_just_ended(j, currPoint, df):
                         curr_trip_start_point = currPoint
                         just_ended = False
-                    # Jump ahead: we have processed up to index j.
                     i = j + 1
                 else:
-                    # If no trip end is found, we have reached the end of the points.
+                    # No trip end was detected; we have reached the end.
                     i = j
 
-            # End of while loop.
         esds.store_pipeline_time(
             user_id,
-            ecwp.PipelineStages.TRIP_SEGMENTATION.name +
-            "/segment_into_trips_dist/loop",
+            ecwp.PipelineStages.TRIP_SEGMENTATION.name + "/segment_into_trips_dist/loop",
             time.time(),
             t_loop.elapsed
         )
 
-        # Check for a possible incomplete final trip – if the trip has not ended
-        # but there is evidence (e.g. a transition) that it should.
+        # Check for a possible incomplete final trip.
         if not just_ended and n_points > 0:
-            currPoint = ad.AttrDict(self.filtered_points_df.iloc[-1])
+            currPoint = ad.AttrDict(df.iloc[-1])
             if len(self.transition_df) > 0:
                 stopped_moving_after_last = self.transition_df[
                     (self.transition_df.ts > currPoint.ts) &
@@ -155,14 +148,11 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
                       lastPoint, timeDelta, distDelta)
         if timeDelta > self.time_threshold:
             speedDelta = old_div(distDelta, timeDelta) if timeDelta > 0 else np.nan
-            # Compute an approximate speed threshold.
-            speedThreshold = old_div(float(self.distance_threshold * 2), (old_div(self.time_threshold, 2)))
             if eaisr.is_tracking_restarted_in_range(lastPoint.ts, currPoint.ts, timeseries, self.transition_df):
                 logging.debug("Tracking was restarted, ending trip")
                 return True
             ongoing_motion_in_range = eaisr.get_ongoing_motion_in_range(lastPoint.ts, currPoint.ts, timeseries, self.motion_list)
-            ongoing_motion_check = len(ongoing_motion_in_range) > 0
-            if timeDelta > self.time_threshold and not ongoing_motion_check:
+            if timeDelta > self.time_threshold and not ongoing_motion_in_range:
                 logging.debug("Large gap (%s > %s) with no ongoing motion; ending trip",
                               timeDelta, self.time_threshold)
                 return True
@@ -170,7 +160,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
             if timeDelta > TWELVE_HOURS:
                 logging.debug("Time gap > 12 hours; ending trip")
                 return True
-            if (timeDelta > self.time_threshold and speedDelta < speedThreshold):
+            if timeDelta > self.time_threshold and speedDelta < self.speedThreshold:
                 if eaistc.is_huge_invalid_ts_offset(self, lastPoint, currPoint, timeseries, ongoing_motion_in_range):
                     logging.debug("Invalid timestamp offset detected for point idx %s", currPoint.idx)
                     self.filtered_points_df.valid.iloc[currPoint.idx] = False
@@ -182,7 +172,7 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
             else:
                 logging.debug("Continuing trip: time gap %s vs %s, dist gap %s vs %s, speed gap %s vs %s",
                               timeDelta, self.time_threshold, distDelta, self.distance_threshold,
-                              speedDelta, speedThreshold)
+                              speedDelta, self.speedThreshold)
                 return False
         else:
             return False
@@ -200,7 +190,8 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
     def continue_just_ended(self, idx, currPoint, filtered_points_df):
         """
         Sometimes a point that occurs just after a trip end (e.g. within a minute
-        and within the distance threshold) should be considered as belonging to the previous trip.
+        and within the distance threshold) should be considered as belonging to
+        the previous trip.
         """
         if idx == 0:
             return False
