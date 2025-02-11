@@ -19,6 +19,20 @@ import emission.storage.decorations.stats_queries as esds
 import emission.core.timer as ect
 import emission.core.wrapper.pipelinestate as ecwp
 
+# Define a vectorized haversine function for bulk distance computations.
+def vectorized_haversine(lon1, lat1, lon2, lat2):
+    """
+    Compute the great-circle distance (in meters) between two points given as numpy arrays.
+    """
+    earth_radius = 6371000  # meters
+    lat1, lat2 = np.radians(lat1), np.radians(lat2)
+    lon1, lon2 = np.radians(lon1), np.radians(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+    return 2 * earth_radius * np.arcsin(np.sqrt(a))
+
+
 class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
     def __init__(self, time_threshold, point_threshold, distance_threshold):
         """
@@ -31,16 +45,19 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         self.point_threshold = point_threshold
         self.distance_threshold = distance_threshold
         # Pre-compute approximate speed threshold:
-        # speedThreshold = (distance_threshold * 2) / (time_threshold/2) = 4 * distance_threshold / time_threshold
+        # speedThreshold = 4 * distance_threshold / time_threshold
         self.speedThreshold = 4.0 * self.distance_threshold / self.time_threshold
 
     def segment_into_trips(self, timeseries, time_query, filtered_points_df):
         """
         Process the filtered points (assumed to be generated using a distance filter)
         and return a list of (trip_start, trip_end) segmentation tuples.
+        This version precomputes per–point differences (time gap, distance, speed)
+        in a vectorized way but then follows the original iterative logic.
         """
         with ect.Timer() as t_get_filtered_points:
-            self.filtered_points_df = filtered_points_df
+            # Work on a copy so we do not modify the original
+            self.filtered_points_df = filtered_points_df.copy()
             user_id = self.filtered_points_df["user_id"].iloc[0]
         esds.store_pipeline_time(
             user_id,
@@ -64,8 +81,30 @@ class DwellSegmentationDistFilter(eaist.TripSegmentationMethod):
         self.last_ts_processed = None
         logging.info("Last ts processed = %s", self.last_ts_processed)
 
-        df = self.filtered_points_df  # local alias for speed
+        # Work on a local alias for speed.
+        df = self.filtered_points_df
         n_points = len(df)
+
+        # ---------------------------
+        # Vectorized pre-computation:
+        # ---------------------------
+        # Compute time differences (difference between current and previous ts)
+        df['ts_diff'] = df['ts'].diff()
+
+        # Compute distance differences using a vectorized haversine.
+        df['lat_prev'] = df['latitude'].shift(1)
+        df['lon_prev'] = df['longitude'].shift(1)
+        # For the first point, the distance will be NaN; that’s acceptable.
+        df['delta_d'] = vectorized_haversine(df['lon_prev'].values,
+                                             df['lat_prev'].values,
+                                             df['longitude'].values,
+                                             df['latitude'].values)
+        # Compute speed in m/s (if ts_diff==0, speed will be NaN)
+        df['speed'] = old_div(df['delta_d'], df['ts_diff'])
+        # ---------------------------
+        # End vectorized pre-computation.
+        # ---------------------------
+
         i = 0
         just_ended = True
         curr_trip_start_point = None
