@@ -8,6 +8,7 @@ standard_library.install_aliases()
 from builtins import *
 from builtins import object
 import logging
+import bisect
 
 # Our imports
 import emission.analysis.configs.dynamic_config as eadc
@@ -67,37 +68,28 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     time_query = esda.get_time_query_for_trip_like(esda.RAW_TRIP_KEY, trip_entry.get_id())
     distance_from_place = _get_distance_from_start_place_to_end(trip_entry)
     
-    # Preload the filtered location entries as a list and sort using the 'data.ts' field from the dict
+    # Preload and sort filtered location entries, and build a separate list of timestamps for fast lookups.
     filtered_loc_entries = list(ts.find_entries(["background/filtered_location"], time_query))
     filtered_loc_entries.sort(key=lambda entry: entry["data"]["ts"])
+    timestamps = [entry["data"]["ts"] for entry in filtered_loc_entries]
     
     # Preload BLE entries during the trip as a list
     ble_entries_during_trip = list(ts.find_entries(["background/bluetooth_ble"], time_query))
     
-    # Binary search helper to mimic ts.get_entry_at_ts using the preloaded filtered location entries
+    # Binary search using bisect: fast lookup of an entry for a given timestamp.
     def get_entry_at_ts(target_ts):
-        lo = 0
-        hi = len(filtered_loc_entries) - 1
-        best = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            entry = filtered_loc_entries[mid]
-            current_ts = entry["data"]["ts"]
-            if current_ts == target_ts:
-                return entry
-            elif current_ts < target_ts:
-                best = entry
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best if best is not None else filtered_loc_entries[0]
+        idx = bisect.bisect_left(timestamps, target_ts)
+        if idx < len(timestamps) and timestamps[idx] == target_ts:
+            return filtered_loc_entries[idx]
+        if idx == 0:
+            return filtered_loc_entries[0]
+        return filtered_loc_entries[idx - 1]
     
     def get_loc_for_ts(timestamp):
         entry = get_entry_at_ts(timestamp)
-        # Wrap the entry data into a Location object
         return ecwl.Location(entry["data"])
     
-    # Choose the segmentation method based on the trip source
+    # Choose the segmentation method based on trip_source.
     if trip_source == "DwellSegmentationTimeFilter":
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_motion as shcm
         segmentation_method = shcm.SmoothedHighConfidenceMotion(
@@ -121,21 +113,23 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     else:
         raise ValueError("Unknown trip source: {}".format(trip_source))
     
-    # Compute segmentation points
+    # Compute segmentation points.
     segmentation_points = segmentation_method.segment_into_sections(ts, distance_from_place, time_query)
     
-    # Use our helper to get the trip start and end locations
+    # Retrieve trip boundaries using our fast lookup.
     trip_start_loc = get_loc_for_ts(trip_entry.data.start_ts)
     trip_end_loc = get_loc_for_ts(trip_entry.data.end_ts)
     logging.debug("trip_start_loc = %s, trip_end_loc = %s" % (trip_start_loc, trip_end_loc))
+    
+    # Cache the dynamic configuration outside the loop to avoid repeated calls.
+    dynamic_config = eadc.get_dynamic_config()
     
     prev_section_entry = None
 
     # Use the original conversion helper to convert segmentation point rows
     get_loc_for_row = lambda row: ts.df_row_to_entry("background/filtered_location", row).data
-    
+
     for i, (start_loc_doc, end_loc_doc, sensed_mode) in enumerate(segmentation_points):
-        # Convert the dataframe row to an entry using the original method
         start_loc = get_loc_for_row(start_loc_doc)
         end_loc = get_loc_for_row(end_loc_doc)
         logging.debug("start_loc = %s, end_loc = %s" % (start_loc, end_loc))
@@ -143,14 +137,13 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
         section = ecwc.Section()
         section.trip_id = trip_entry.get_id()
         if prev_section_entry is None:
-            # For the first section, force the start to be the trip's start location
+            # For the first section, force the start to be the trip's start location.
             start_loc = trip_start_loc
         if i == len(segmentation_points) - 1:
-            # For the last section, force the end to be the trip's end location
+            # For the last section, force the end to be the trip's end location.
             end_loc = trip_end_loc
         
-        # Determine the BLE-sensed mode using the preloaded BLE entries
-        dynamic_config = eadc.get_dynamic_config()
+        # Determine the BLE-sensed mode using the preloaded BLE entries.
         ble_sensed_mode = emcble.get_ble_sensed_vehicle_for_section(
             ble_entries_during_trip, start_loc.ts, end_loc.ts, dynamic_config
         )
@@ -159,7 +152,7 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
         section_entry = ecwe.Entry.create_entry(user_id, esda.RAW_SECTION_KEY, section, create_id=True)
         
         if prev_section_entry is not None:
-            # Create a stop to link the sections together
+            # Create a stop entry to link sections.
             stop = ecws.Stop()
             stop.trip_id = trip_entry.get_id()
             stop_entry = ecwe.Entry.create_entry(user_id, esda.RAW_STOP_KEY, stop, create_id=True)
