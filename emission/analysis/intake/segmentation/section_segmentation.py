@@ -64,16 +64,43 @@ def segment_current_sections(user_id):
 
 def segment_trip_into_sections(user_id, trip_entry, trip_source):
     ts = esta.TimeSeries.get_time_series(user_id)
-    # Get the time range for segmenting this trip
     time_query = esda.get_time_query_for_trip_like(esda.RAW_TRIP_KEY, trip_entry.get_id())
-    # Calculate the distance from the start place to the end of the trip
     distance_from_place = _get_distance_from_start_place_to_end(trip_entry)
-    # Retrieve BLE entries for the trip in one batch query
-    ble_entries_during_trip = ts.find_entries(["background/bluetooth_ble"], time_query)
-
+    
+    # Preload the filtered location entries as a list and sort using the 'data.ts' field from the dict
+    filtered_loc_entries = list(ts.find_entries(["background/filtered_location"], time_query))
+    filtered_loc_entries.sort(key=lambda entry: entry["data"]["ts"])
+    
+    # Preload BLE entries during the trip as a list
+    ble_entries_during_trip = list(ts.find_entries(["background/bluetooth_ble"], time_query))
+    
+    # Binary search helper to mimic ts.get_entry_at_ts using the preloaded filtered location entries
+    def get_entry_at_ts(target_ts):
+        lo = 0
+        hi = len(filtered_loc_entries) - 1
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            entry = filtered_loc_entries[mid]
+            current_ts = entry["data"]["ts"]
+            if current_ts == target_ts:
+                return entry
+            elif current_ts < target_ts:
+                best = entry
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best if best is not None else filtered_loc_entries[0]
+    
+    def get_loc_for_ts(timestamp):
+        entry = get_entry_at_ts(timestamp)
+        # Wrap the entry data into a Location object
+        return ecwl.Location(entry["data"])
+    
+    # Choose the segmentation method based on the trip source
     if trip_source == "DwellSegmentationTimeFilter":
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_motion as shcm
-        shcmsm = shcm.SmoothedHighConfidenceMotion(
+        segmentation_method = shcm.SmoothedHighConfidenceMotion(
             60, 100,
             [ecwm.MotionTypes.TILTING,
              ecwm.MotionTypes.UNKNOWN,
@@ -81,10 +108,9 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
              ecwm.MotionTypes.NONE,
              ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE]
         )
-    else:
-        # trip_source must be "DwellSegmentationDistFilter"
+    elif trip_source == "DwellSegmentationDistFilter":
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_with_visit_transitions as shcmvt
-        shcmsm = shcmvt.SmoothedHighConfidenceMotionWithVisitTransitions(
+        segmentation_method = shcmvt.SmoothedHighConfidenceMotionWithVisitTransitions(
             49, 50,
             [ecwm.MotionTypes.TILTING,
              ecwm.MotionTypes.UNKNOWN,
@@ -92,81 +118,56 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
              ecwm.MotionTypes.NONE,  # iOS only
              ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE]  # iOS only
         )
-
-    # Obtain segmentation points from the segmentation method.
-    segmentation_points = shcmsm.segment_into_sections(ts, distance_from_place, time_query)
-
-    # Since we are segmenting an existing trip into sections, we do not need to worry about linking with
-    # a prior place, since it will be linked through the trip object.
-    # So this is much simpler than the trip case.
-    # Again, since this is segmenting a trip, we can just start with a section.
+    else:
+        raise ValueError("Unknown trip source: {}".format(trip_source))
+    
+    # Compute segmentation points
+    segmentation_points = segmentation_method.segment_into_sections(ts, distance_from_place, time_query)
+    
+    # Use our helper to get the trip start and end locations
+    trip_start_loc = get_loc_for_ts(trip_entry.data.start_ts)
+    trip_end_loc = get_loc_for_ts(trip_entry.data.end_ts)
+    logging.debug("trip_start_loc = %s, trip_end_loc = %s" % (trip_start_loc, trip_end_loc))
+    
     prev_section_entry = None
 
-    # *** NEW BATCH LOADING: Read all filtered location entries for the trip upfront ***
-    # Instead of fetching each location individually, load the full dataframe of filtered locations once.
-    filtered_locations_df = ts.get_data_df("background/filtered_location", time_query)
-    if filtered_locations_df.empty:
-        logging.error("No filtered locations found for trip %s", trip_entry.get_id())
-        return
-
-    # Helper: convert a dataframe row to a location using the original conversion method.
-    get_loc_for_row = lambda row: ecwl.Location(ts.df_row_to_entry("background/filtered_location", row).data)
-
-    # For the trip boundaries, use the original lookup to preserve expected behavior.
-    # In the original code, this ensures that the trip start/end locations match the timestamps
-    # specified in the trip entry.
-    trip_start_loc = ecwl.Location(ts.get_entry_at_ts("background/filtered_location", "data.ts",
-                                                       trip_entry.data.start_ts)["data"])
-    trip_end_loc = ecwl.Location(ts.get_entry_at_ts("background/filtered_location", "data.ts",
-                                                     trip_entry.data.end_ts)["data"])
-    logging.debug("trip_start_loc = %s, trip_end_loc = %s", trip_start_loc, trip_end_loc)
-
-    # Process each segmentation point by converting the preloaded location rows.
+    # Use the original conversion helper to convert segmentation point rows
+    get_loc_for_row = lambda row: ts.df_row_to_entry("background/filtered_location", row).data
+    
     for i, (start_loc_doc, end_loc_doc, sensed_mode) in enumerate(segmentation_points):
-        logging.debug("start_loc_doc = %s, end_loc_doc = %s", start_loc_doc, end_loc_doc)
-        # Convert the preloaded dataframe rows directly into Location objects using the helper.
+        # Convert the dataframe row to an entry using the original method
         start_loc = get_loc_for_row(start_loc_doc)
         end_loc = get_loc_for_row(end_loc_doc)
-        logging.debug("start_loc = %s, end_loc = %s", start_loc, end_loc)
-
+        logging.debug("start_loc = %s, end_loc = %s" % (start_loc, end_loc))
+        
         section = ecwc.Section()
         section.trip_id = trip_entry.get_id()
         if prev_section_entry is None:
-            # This is the first point, so we want to start from the start of the trip,
-            # not the start of this segment.
+            # For the first section, force the start to be the trip's start location
             start_loc = trip_start_loc
         if i == len(segmentation_points) - 1:
-            # This is the last point, so we want to end at the end of the trip,
-            # not at the end of this segment.
+            # For the last section, force the end to be the trip's end location
             end_loc = trip_end_loc
-
-        # ble_sensed_mode represents the vehicle that was sensed via BLE beacon during the section.
-        # For now, we rely on the current segmentation implementation and then fill in
-        # ble_sensed_mode by looking at scans within the timestamp range of the section.
+        
+        # Determine the BLE-sensed mode using the preloaded BLE entries
         dynamic_config = eadc.get_dynamic_config()
         ble_sensed_mode = emcble.get_ble_sensed_vehicle_for_section(
             ble_entries_during_trip, start_loc.ts, end_loc.ts, dynamic_config
         )
-
-        # Fill in the section with start/end location data, time, and mode information.
+        
         fill_section(section, start_loc, end_loc, sensed_mode, ble_sensed_mode)
-        # Create the entry after filling in the section so that we know the data is included properly.
-        section_entry = ecwe.Entry.create_entry(user_id, esda.RAW_SECTION_KEY,
-                                                  section, create_id=True)
-
+        section_entry = ecwe.Entry.create_entry(user_id, esda.RAW_SECTION_KEY, section, create_id=True)
+        
         if prev_section_entry is not None:
-            # If this is not the first section, create a stop to link the two sections together.
-            # The expectation is prev_section -> stop -> curr_section.
+            # Create a stop to link the sections together
             stop = ecws.Stop()
             stop.trip_id = trip_entry.get_id()
-            stop_entry = ecwe.Entry.create_entry(user_id, esda.RAW_STOP_KEY,
-                                                 stop, create_id=True)
-            logging.debug("stop = %s, stop_entry = %s", stop, stop_entry)
+            stop_entry = ecwe.Entry.create_entry(user_id, esda.RAW_STOP_KEY, stop, create_id=True)
+            logging.debug("stop = %s, stop_entry = %s" % (stop, stop_entry))
             stitch_together(prev_section_entry, stop_entry, section_entry)
             ts.insert(stop_entry)
             ts.update(prev_section_entry)
-
-        # After processing, insert the section entry and update for the next iteration.
+        
         ts.insert(section_entry)
         prev_section_entry = section_entry
 
