@@ -71,35 +71,36 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     # Retrieve BLE entries for the trip in one batch query
     ble_entries_during_trip = ts.find_entries(["background/bluetooth_ble"], time_query)
 
-    if (trip_source == "DwellSegmentationTimeFilter"):
+    if trip_source == "DwellSegmentationTimeFilter":
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_motion as shcm
-        shcmsm = shcm.SmoothedHighConfidenceMotion(60, 100, [ecwm.MotionTypes.TILTING,
-                                                        ecwm.MotionTypes.UNKNOWN,
-                                                        ecwm.MotionTypes.STILL,
-                                                        ecwm.MotionTypes.NONE,
-                                                        ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE])
+        shcmsm = shcm.SmoothedHighConfidenceMotion(
+            60, 100,
+            [ecwm.MotionTypes.TILTING,
+             ecwm.MotionTypes.UNKNOWN,
+             ecwm.MotionTypes.STILL,
+             ecwm.MotionTypes.NONE,
+             ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE]
+        )
     else:
-        assert(trip_source == "DwellSegmentationDistFilter")
+        # trip_source must be "DwellSegmentationDistFilter"
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_with_visit_transitions as shcmvt
         shcmsm = shcmvt.SmoothedHighConfidenceMotionWithVisitTransitions(
-                                                        49, 50, [ecwm.MotionTypes.TILTING,
-                                                        ecwm.MotionTypes.UNKNOWN,
-                                                        ecwm.MotionTypes.STILL,
-                                                        ecwm.MotionTypes.NONE, # iOS only
-                                                        ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE]) # iOS only
-        
+            49, 50,
+            [ecwm.MotionTypes.TILTING,
+             ecwm.MotionTypes.UNKNOWN,
+             ecwm.MotionTypes.STILL,
+             ecwm.MotionTypes.NONE,  # iOS only
+             ecwm.MotionTypes.STOPPED_WHILE_IN_VEHICLE]  # iOS only
+        )
+
+    # Obtain segmentation points from the segmentation method.
     segmentation_points = shcmsm.segment_into_sections(ts, distance_from_place, time_query)
 
     # Since we are segmenting an existing trip into sections, we do not need to worry about linking with
     # a prior place, since it will be linked through the trip object.
     # So this is much simpler than the trip case.
-    # Again, since this is segmenting a trip, we can just start with a section
-
+    # Again, since this is segmenting a trip, we can just start with a section.
     prev_section_entry = None
-
-    # TODO: Should we link the locations to the trips this way, or by using a foreign key?
-    # If we want to use a foreign key, then we need to include the object id in the data df as well so that we can
-    # set it properly.
 
     # *** NEW BATCH LOADING: Read all filtered location entries for the trip upfront ***
     # Instead of fetching each location individually, load the full dataframe of filtered locations once.
@@ -108,16 +109,24 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
         logging.error("No filtered locations found for trip %s", trip_entry.get_id())
         return
 
-    # Use the first and last entries from the preloaded dataframe as the trip's start and end locations.
-    trip_start_loc = ecwl.Location(filtered_locations_df.iloc[0])
-    trip_end_loc = ecwl.Location(filtered_locations_df.iloc[-1])
+    # Helper: convert a dataframe row to a location using the original conversion method.
+    get_loc_for_row = lambda row: ecwl.Location(ts.df_row_to_entry("background/filtered_location", row).data)
+
+    # For the trip boundaries, use the original lookup to preserve expected behavior.
+    # In the original code, this ensures that the trip start/end locations match the timestamps
+    # specified in the trip entry.
+    trip_start_loc = ecwl.Location(ts.get_entry_at_ts("background/filtered_location", "data.ts",
+                                                       trip_entry.data.start_ts)["data"])
+    trip_end_loc = ecwl.Location(ts.get_entry_at_ts("background/filtered_location", "data.ts",
+                                                     trip_entry.data.end_ts)["data"])
     logging.debug("trip_start_loc = %s, trip_end_loc = %s", trip_start_loc, trip_end_loc)
 
+    # Process each segmentation point by converting the preloaded location rows.
     for i, (start_loc_doc, end_loc_doc, sensed_mode) in enumerate(segmentation_points):
         logging.debug("start_loc_doc = %s, end_loc_doc = %s", start_loc_doc, end_loc_doc)
-        # Convert the preloaded dataframe rows directly into Location objects.
-        start_loc = ecwl.Location(start_loc_doc)
-        end_loc = ecwl.Location(end_loc_doc)
+        # Convert the preloaded dataframe rows directly into Location objects using the helper.
+        start_loc = get_loc_for_row(start_loc_doc)
+        end_loc = get_loc_for_row(end_loc_doc)
         logging.debug("start_loc = %s, end_loc = %s", start_loc, end_loc)
 
         section = ecwc.Section()
@@ -132,22 +141,22 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
             end_loc = trip_end_loc
 
         # ble_sensed_mode represents the vehicle that was sensed via BLE beacon during the section.
-        # For now, we are relying on the current segmentation implementation and then filling in
+        # For now, we rely on the current segmentation implementation and then fill in
         # ble_sensed_mode by looking at scans within the timestamp range of the section.
         dynamic_config = eadc.get_dynamic_config()
         ble_sensed_mode = emcble.get_ble_sensed_vehicle_for_section(
             ble_entries_during_trip, start_loc.ts, end_loc.ts, dynamic_config
         )
 
-        # Fill in section with start and end location data, time, and mode information.
+        # Fill in the section with start/end location data, time, and mode information.
         fill_section(section, start_loc, end_loc, sensed_mode, ble_sensed_mode)
-        # Create the entry after filling in the section so that we know that the data is included properly.
+        # Create the entry after filling in the section so that we know the data is included properly.
         section_entry = ecwe.Entry.create_entry(user_id, esda.RAW_SECTION_KEY,
                                                   section, create_id=True)
 
         if prev_section_entry is not None:
             # If this is not the first section, create a stop to link the two sections together.
-            # The expectation is prev_section -> stop -> curr_section
+            # The expectation is prev_section -> stop -> curr_section.
             stop = ecws.Stop()
             stop.trip_id = trip_entry.get_id()
             stop_entry = ecwe.Entry.create_entry(user_id, esda.RAW_STOP_KEY,
@@ -160,6 +169,7 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
         # After processing, insert the section entry and update for the next iteration.
         ts.insert(section_entry)
         prev_section_entry = section_entry
+
 
 
 def fill_section(section, start_loc, end_loc, sensed_mode, ble_sensed_mode=None):
