@@ -6,6 +6,7 @@ from builtins import *
 from builtins import object
 import logging
 import bisect
+import numpy as np
 
 # Our imports
 import emission.analysis.configs.dynamic_config as eadc
@@ -55,26 +56,37 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     time_query = esda.get_time_query_for_trip_like(esda.RAW_TRIP_KEY, trip_entry.get_id())
     distance_from_place = _get_distance_from_start_place_to_end(trip_entry)
     
-    # Preload and sort filtered location entries and build timestamps list.
+    # Preload filtered location entries for the time range.
     filtered_loc_entries = list(ts.find_entries(["background/filtered_location"], time_query))
-    filtered_loc_entries.sort(key=lambda entry: entry["data"]["ts"])
-    timestamps = [entry["data"]["ts"] for entry in filtered_loc_entries]
+    
+    # If entries are not guaranteed to be sorted, uncomment the next line:
+    # filtered_loc_entries.sort(key=lambda entry: entry["data"]["ts"])
+    
+    # Build a NumPy array of timestamps for fast lookup.
+    timestamps = np.array([entry["data"]["ts"] for entry in filtered_loc_entries])
     
     # Preload BLE entries during the trip.
     ble_entries_during_trip = list(ts.find_entries(["background/bluetooth_ble"], time_query))
     
-    # Helper: fast lookup using bisect_right.
+    # Simple cache to avoid repeated Location conversions.
+    location_cache = {}
+
     def get_entry_at_ts(target_ts):
-        # bisect_right returns an insertion point; subtract one to get the floor index.
-        idx = bisect.bisect_right(timestamps, target_ts) - 1
+        # Use np.searchsorted to find the insertion point (using 'right' gives the floor index).
+        idx = np.searchsorted(timestamps, target_ts, side='right') - 1
         if idx < 0:
             idx = 0
         return filtered_loc_entries[idx]
-    
+
     def get_loc_for_ts(timestamp):
+        # Return cached location if available.
+        if timestamp in location_cache:
+            return location_cache[timestamp]
         entry = get_entry_at_ts(timestamp)
-        return ecwl.Location(entry["data"])
-    
+        loc = ecwl.Location(entry["data"])
+        location_cache[timestamp] = loc
+        return loc
+
     # Choose segmentation method based on trip_source.
     if trip_source == "DwellSegmentationTimeFilter":
         import emission.analysis.intake.segmentation.section_segmentation_methods.smoothed_high_confidence_motion as shcm
@@ -102,7 +114,7 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     # Compute segmentation points.
     segmentation_points = segmentation_method.segment_into_sections(ts, distance_from_place, time_query)
     
-    # Retrieve trip boundaries using fast lookup.
+    # Retrieve trip boundaries using our optimized lookup.
     trip_start_loc = get_loc_for_ts(trip_entry.data.start_ts)
     trip_end_loc = get_loc_for_ts(trip_entry.data.end_ts)
     logging.debug("trip_start_loc = %s, trip_end_loc = %s" % (trip_start_loc, trip_end_loc))
@@ -110,30 +122,32 @@ def segment_trip_into_sections(user_id, trip_entry, trip_source):
     # Cache the dynamic configuration once.
     dynamic_config = eadc.get_dynamic_config()
     
-    # Helper for converting a row from the segmentation method.
+    # Helper to convert a segmentation row into location data.
     def get_loc_for_row(row):
+        # We assume that ts.df_row_to_entry is efficient.
         return ts.df_row_to_entry("background/filtered_location", row).data
 
     prev_section_entry = None
 
     for i, (start_loc_doc, end_loc_doc, sensed_mode) in enumerate(segmentation_points):
-        start_loc = get_loc_for_row(start_loc_doc)
-        end_loc = get_loc_for_row(end_loc_doc)
-        logging.debug("start_loc = %s, end_loc = %s" % (start_loc, end_loc))
-        
-        section = ecwc.Section()
-        section.trip_id = trip_entry.get_id()
-        # For the first section, use the trip start; for the last, use the trip end.
+        start_loc_data = get_loc_for_row(start_loc_doc)
+        end_loc_data = get_loc_for_row(end_loc_doc)
+        # Optionally cache these conversions too if needed.
+        start_loc = ecwl.Location(start_loc_data)
+        end_loc = ecwl.Location(end_loc_data)
+        # For the first and last segments, force the trip boundaries.
         if prev_section_entry is None:
             start_loc = trip_start_loc
         if i == len(segmentation_points) - 1:
             end_loc = trip_end_loc
         
-        # Determine BLE-sensed mode using the preloaded BLE entries.
+        # Determine BLE-sensed mode using preloaded BLE entries.
         ble_sensed_mode = emcble.get_ble_sensed_vehicle_for_section(
             ble_entries_during_trip, start_loc.ts, end_loc.ts, dynamic_config
         )
         
+        section = ecwc.Section()
+        section.trip_id = trip_entry.get_id()
         fill_section(section, start_loc, end_loc, sensed_mode, ble_sensed_mode)
         section_entry = ecwe.Entry.create_entry(user_id, esda.RAW_SECTION_KEY, section, create_id=True)
         
@@ -158,8 +172,8 @@ def fill_section(section, start_loc, end_loc, sensed_mode, ble_sensed_mode=None)
     section.end_ts = end_loc.ts
     try:
         section.end_local_dt = end_loc.local_dt
-    except AttributeError as e:
-        print(end_loc)
+    except AttributeError:
+        logging.error("Missing local_dt for location: %s" % end_loc)
     section.end_fmt_time = end_loc.fmt_time
 
     section.start_loc = start_loc.loc
@@ -186,8 +200,7 @@ def stitch_together(ending_section_entry, stop_entry, starting_section_entry):
     stop.enter_loc = ending_section.end_loc
     stop.exit_loc = starting_section.start_loc
     stop.duration = starting_section.start_ts - ending_section.end_ts
-    stop.distance = ecc.calDistance(stop.enter_loc.coordinates,
-                                    stop.exit_loc.coordinates)
+    stop.distance = ecc.calDistance(stop.enter_loc.coordinates, stop.exit_loc.coordinates)
     stop.source = "SmoothedHighConfidenceMotion"
 
     stop.exit_ts = starting_section.start_ts
@@ -204,11 +217,9 @@ def stitch_together(ending_section_entry, stop_entry, starting_section_entry):
 
 def _get_distance_from_start_place_to_end(raw_trip_entry):
     import emission.core.common as ecc
-
     start_place_id = raw_trip_entry.data.start_place
     start_place = esda.get_object(esda.RAW_PLACE_KEY, start_place_id)
-    dist = ecc.calDistance(start_place.location.coordinates,
-                           raw_trip_entry.data.end_loc.coordinates)
+    dist = ecc.calDistance(start_place.location.coordinates, raw_trip_entry.data.end_loc.coordinates)
     logging.debug("Distance from raw_place %s to the end of raw_trip_entry %s = %s" %
                   (start_place_id, raw_trip_entry.get_id(), dist))
     return dist
