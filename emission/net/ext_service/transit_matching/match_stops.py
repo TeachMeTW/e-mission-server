@@ -5,6 +5,10 @@ import attrdict as ad
 import itertools
 import os
 import time
+import hashlib
+import pandas as pd
+import pathlib
+import csv
 
 try:
     GEOFABRIK_OVERPASS_KEY = os.environ.get("GEOFABRIK_OVERPASS_KEY")
@@ -13,6 +17,10 @@ try:
 except:
     print("overpass not configured, falling back to public overpass api")
     url = "https://lz4.overpass-api.de/"
+
+# Create a cache directory if it doesn't exist
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 try:
     with open('conf/net/ext_service/overpass_transit_stops_query_template', 'r', encoding='UTF-8') as query_file:
@@ -25,7 +33,28 @@ except FileNotFoundError:
 RETRY = -1
 
 def make_request_and_catch(overpass_query):
+    # Create a unique filename based on the query hash
+    query_hash = hashlib.md5(overpass_query.encode()).hexdigest()
+    cache_file = os.path.join(CACHE_DIR, f"{query_hash}.csv")
+    
+    # Check if we're in production mode - if GEOFABRIK_OVERPASS_KEY is set, we're in production
+    in_production = os.environ.get("GEOFABRIK_OVERPASS_KEY") is not None
+    
+    # If cache file exists and we're not in production, use the cached data
+    if not in_production and os.path.exists(cache_file):
+        logging.info(f"Using cached response from {cache_file}")
+        try:
+            # Read the CSV file and convert to the expected format
+            df = pd.read_csv(cache_file)
+            # Convert DataFrame to list of dictionaries 
+            all_results = df.to_dict('records')
+            return all_results
+        except Exception as e:
+            logging.warning(f"Error reading cache file: {e}, falling back to API")
+    
+    # If no cache or we're in production, make the API request
     try:
+        logging.info("Making API request to Overpass")
         response = requests.post(url + "api/interpreter", data=overpass_query)
     except requests.exceptions.ChunkedEncodingError as e:
         logging.info("ChunkedEncodingError while creating request %s" % (e))
@@ -35,6 +64,27 @@ def make_request_and_catch(overpass_query):
 
     try:
         all_results = response.json()["elements"]
+        
+        # If we successfully got results and we're not in production, cache them
+        if not in_production and all_results:
+            try:
+                # Convert complex nested structures to strings for CSV storage
+                flat_results = []
+                for result in all_results:
+                    flat_result = result.copy()
+                    # Convert nested objects to strings
+                    for key, value in flat_result.items():
+                        if isinstance(value, (dict, list)):
+                            flat_result[key] = json.dumps(value)
+                    flat_results.append(flat_result)
+                
+                # Create DataFrame and save to CSV
+                df = pd.DataFrame(flat_results)
+                df.to_csv(cache_file, index=False)
+                logging.info(f"Cached API response to {cache_file}")
+            except Exception as e:
+                logging.warning(f"Error caching response: {e}")
+        
         return all_results
     except json.decoder.JSONDecodeError as e:
         logging.info("Unable to decode response with status_code %s, text %s" %
@@ -85,6 +135,16 @@ def get_public_transit_stops(min_lat, min_lon, max_lat, max_lon):
 
     logging.info(f"after all retries, retry_count = {retry_count}, call_return = {'RETRY' if call_return == RETRY else len(call_return)}...")
     all_results = call_return
+    
+    # Process the results - if they came from cache, we need to deserialize JSON strings
+    for result in all_results:
+        for key, value in result.items():
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                try:
+                    result[key] = json.loads(value)
+                except:
+                    # If it's not valid JSON, keep it as is
+                    pass
 
     relations = [ad.AttrDict(r) for r in all_results if r["type"] == "relation" and r["tags"]["type"] == "route"]
     logging.debug("Found %d relations with ids %s" % (len(relations), [r["id"] for r in relations]))
