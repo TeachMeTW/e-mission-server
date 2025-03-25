@@ -195,7 +195,6 @@ def runIntakePipeline(uuid):
     import emission.analysis.intake.segmentation.section_segmentation as eaiss
     import emission.analysis.intake.cleaning.location_smoothing as eaicl
     import emission.analysis.intake.cleaning.clean_and_resample as eaicr
-    import emission.analysis.classification.inference.mode.pipeline as eacimp
     import emission.analysis.classification.inference.mode.rule_engine as eacimr
     import emission.analysis.userinput.expectations as eaue
     import emission.analysis.classification.inference.labels.pipeline as eacilp

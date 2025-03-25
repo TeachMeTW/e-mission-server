@@ -35,7 +35,7 @@ RETRY = -1
 def make_request_and_catch(overpass_query):
     # Create a unique filename based on the query hash
     query_hash = hashlib.md5(overpass_query.encode()).hexdigest()
-    cache_file = os.path.join(CACHE_DIR, f"{query_hash}.csv")
+    cache_file = os.path.join(CACHE_DIR, f"{query_hash}.json")
     
     # Check if we're in production mode - if GEOFABRIK_OVERPASS_KEY is set, we're in production
     in_production = os.environ.get("GEOFABRIK_OVERPASS_KEY") is not None
@@ -44,10 +44,8 @@ def make_request_and_catch(overpass_query):
     if not in_production and os.path.exists(cache_file):
         logging.info(f"Using cached response from {cache_file}")
         try:
-            # Read the CSV file and convert to the expected format
-            df = pd.read_csv(cache_file)
-            # Convert DataFrame to list of dictionaries 
-            all_results = df.to_dict('records')
+            with open(cache_file, 'r') as f:
+                all_results = json.load(f)
             return all_results
         except Exception as e:
             logging.warning(f"Error reading cache file: {e}, falling back to API")
@@ -68,19 +66,8 @@ def make_request_and_catch(overpass_query):
         # If we successfully got results and we're not in production, cache them
         if not in_production and all_results:
             try:
-                # Convert complex nested structures to strings for CSV storage
-                flat_results = []
-                for result in all_results:
-                    flat_result = result.copy()
-                    # Convert nested objects to strings
-                    for key, value in flat_result.items():
-                        if isinstance(value, (dict, list)):
-                            flat_result[key] = json.dumps(value)
-                    flat_results.append(flat_result)
-                
-                # Create DataFrame and save to CSV
-                df = pd.DataFrame(flat_results)
-                df.to_csv(cache_file, index=False)
+                with open(cache_file, 'w') as f:
+                    json.dump(all_results, f)
                 logging.info(f"Cached API response to {cache_file}")
             except Exception as e:
                 logging.warning(f"Error caching response: {e}")
