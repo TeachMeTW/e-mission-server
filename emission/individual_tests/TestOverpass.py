@@ -82,10 +82,10 @@ class OverpassTest(unittest.TestCase):
         logging.info("==== Cleaning up Overpass test environment ====")
         # Restore the original cache state
         if os.path.exists(self.cache_dir):
-            # Clean up the test cache files
+            # Only clean up the test cache files that we know were created during tests
             removed_count = 0
             for file in os.listdir(self.cache_dir):
-                if not self.had_cache or file not in self.old_cache_files:
+                if hasattr(self, 'test_created_files') and file in self.test_created_files:
                     os.remove(os.path.join(self.cache_dir, file))
                     removed_count += 1
             logging.info(f"Removed {removed_count} test cache files")
@@ -184,7 +184,7 @@ class OverpassTest(unittest.TestCase):
         Test that the filesystem caching functionality works correctly.
         
         This test:
-        1. Clears the cache directory
+        1. Notes the initial cache state
         2. Makes a first API call (should create cache)
         3. Checks that cache files were created
         4. Makes a second identical API call (should use cache)
@@ -200,10 +200,9 @@ class OverpassTest(unittest.TestCase):
             del os.environ["GEOFABRIK_OVERPASS_KEY"]
         
         try:
-            # Clean the cache directory
-            for file in os.listdir(self.cache_dir):
-                os.remove(os.path.join(self.cache_dir, file))
-            logging.info(f"Cleared cache directory")
+            # Record initial cache state
+            initial_cache_files = set(os.listdir(self.cache_dir))
+            logging.info(f"Initial cache directory has {len(initial_cache_files)} files")
             
             # Make a first API call - this should create cache files
             logging.info(f"Making first API call (uncached)")
@@ -212,10 +211,16 @@ class OverpassTest(unittest.TestCase):
             first_call_duration = time.time() - start_time
             logging.info(f"First call returned {len(first_result)} stops and took {first_call_duration:.4f}s")
             
-            # Check that cache files were created
-            cache_files = os.listdir(self.cache_dir)
-            logging.info(f"Cache directory now has {len(cache_files)} files")
-            self.assertTrue(len(cache_files) > 0, "No cache files were created after the first API call")
+            # Check that cache files were created and track them
+            current_cache_files = set(os.listdir(self.cache_dir))
+            new_files = current_cache_files - initial_cache_files
+            # Store the list of files created during this test for cleanup
+            if not hasattr(self, 'test_created_files'):
+                self.test_created_files = set()
+            self.test_created_files.update(new_files)
+            
+            logging.info(f"Cache directory now has {len(current_cache_files)} files, added {len(new_files)} new files")
+            self.assertTrue(len(new_files) > 0, "No cache files were created after the first API call")
             
             # Make a second identical API call - this should use the cache
             logging.info(f"Making second API call (should use cache)")
@@ -262,7 +267,7 @@ class OverpassTest(unittest.TestCase):
         1. Notes the initial cache state
         2. Makes an API request that should create cache files
         3. Verifies new cache files are created
-        4. Checks that cache files contain properly formatted CSV data
+        4. Checks that cache files contain properly formatted JSON data
         5. Verifies returned stop data includes expected fields
         
         Cache integrity is essential for reliable operation between sessions.
@@ -290,19 +295,24 @@ class OverpassTest(unittest.TestCase):
             new_files = new_cache_files - initial_cache_files
             logging.info(f"Created {len(new_files)} new cache files")
             
+            # Store the list of files created during this test for cleanup
+            if not hasattr(self, 'test_created_files'):
+                self.test_created_files = set()
+            self.test_created_files.update(new_files)
+            
             self.assertGreater(len(new_files), 0, "No new cache files were created")
             
-            # Verify at least one of the new files is a properly formatted CSV with the expected columns
+            # Verify at least one of the new files is a properly formatted JSON
             for file in new_files:
                 file_path = os.path.join(self.cache_dir, file)
+                self.assertTrue(file.endswith('.json'), f"Cache file {file} does not have .json extension")
                 with open(file_path, 'r') as f:
-                    first_line = f.readline().strip()
-                    logging.info(f"Inspecting cache file {file}: {first_line}")
-                    # Check for either new format (response_json) or old format CSV header
-                    self.assertTrue(
-                        first_line == "response_json" or "," in first_line,
-                        f"Cache file {file} does not contain expected CSV format"
-                    )
+                    try:
+                        cache_data = json.load(f)
+                        logging.info(f"Inspecting cache file {file}: contains {len(cache_data)} elements")
+                        self.assertIsInstance(cache_data, list, f"Cache file {file} does not contain a JSON array")
+                    except json.JSONDecodeError as e:
+                        self.fail(f"Cache file {file} does not contain valid JSON: {e}")
                     
             # Make sure the stops data includes expected fields
             self.assertGreater(len(stops), 0, "No stops found")
@@ -357,12 +367,18 @@ class OverpassTest(unittest.TestCase):
             self.assertIsInstance(query_hash, str, "Query hash is not a string")
             self.assertEqual(len(query_hash), 32, "Query hash is not 32 characters (MD5 length)")
             
-            # Create a mock cache file
-            cache_file = os.path.join(self.cache_dir, f"{query_hash}.csv")
+            # Create a mock cache file using JSON format
+            cache_file = os.path.join(self.cache_dir, f"{query_hash}.json")
+            cache_filename = f"{query_hash}.json"
             logging.info(f"Creating mock cache file: {cache_file}")
+            mock_data = [{"id": 12345, "type": "node", "lat": 37.876, "lon": -122.258, "tags": {"name": "Test Stop"}}]
             with open(cache_file, 'w') as f:
-                f.write("id,type,lat,lon,tags\n")
-                f.write("12345,node,37.876,-122.258,{\"name\":\"Test Stop\"}\n")
+                json.dump(mock_data, f)
+            
+            # Store the file created during this test for cleanup
+            if not hasattr(self, 'test_created_files'):
+                self.test_created_files = set()
+            self.test_created_files.add(cache_filename)
             
             # Create a test overpass query function to intercept the API call
             # This lets us check if the function tries to use the cache before making an API call
@@ -422,15 +438,26 @@ class OverpassTest(unittest.TestCase):
             self.skipTest("Can't safely test production mode with actual key")
         
         try:
+            # Record initial cache state
+            initial_cache_files = set(os.listdir(self.cache_dir))
+            logging.info(f"Initial cache contains {len(initial_cache_files)} files")
+            
             # First make a cached request
             logging.info("Making initial request to populate cache")
             stops = enetm.get_stops_near(loc4, 500)
             logging.info(f"Found {len(stops)} stops near Berkeley BART")
             
-            # Get the cache files that exist now
-            cache_files = set(os.listdir(self.cache_dir))
-            logging.info(f"Cache now contains {len(cache_files)} files")
-            self.assertGreater(len(cache_files), 0, "No cache files created")
+            # Get the cache files created and track them
+            current_cache_files = set(os.listdir(self.cache_dir))
+            new_files = current_cache_files - initial_cache_files
+            logging.info(f"Cache now contains {len(current_cache_files)} files, added {len(new_files)} new files")
+            
+            # Store the list of files created during this test for cleanup
+            if not hasattr(self, 'test_created_files'):
+                self.test_created_files = set()
+            self.test_created_files.update(new_files)
+            
+            self.assertGreater(len(new_files), 0, "No cache files created")
             
             # Now set the environment variable to simulate production mode
             logging.info("Setting GEOFABRIK_OVERPASS_KEY to simulate production mode")
