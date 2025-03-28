@@ -396,7 +396,7 @@ class OverpassTest(unittest.TestCase):
                 
                 # Now make the request - if cache works, it won't call our mock function
                 logging.info("Making request that should use cache")
-                result = enetm.make_request_and_catch(test_query)
+                result = enetm.query_overpass(test_query)
                 
                 # Verify we got a result from the cache
                 self.assertIsInstance(result, list, "Result is not a list")
@@ -421,7 +421,7 @@ class OverpassTest(unittest.TestCase):
         
         This test:
         1. Makes a request to create cache files
-        2. Sets GEOFABRIK_OVERPASS_KEY to simulate production mode
+        2. Sets CACHE_DIR to None to simulate production mode
         3. Patches the requests module to detect API calls
         4. Makes an identical request that should bypass the cache
         5. Verifies that the API was called despite cache existence
@@ -429,8 +429,9 @@ class OverpassTest(unittest.TestCase):
         Production mode should always use the API directly for fresh data.
         """
         logging.info("==== Testing production mode cache bypass ====")
-        # Save original key
+        # Save original key and cache dir
         original_key = os.environ.get("GEOFABRIK_OVERPASS_KEY")
+        original_cache_dir = enetm.CACHE_DIR
         
         # Skip test if we have a real key (to avoid actual API calls)
         if original_key:
@@ -459,9 +460,9 @@ class OverpassTest(unittest.TestCase):
             
             self.assertGreater(len(new_files), 0, "No cache files created")
             
-            # Now set the environment variable to simulate production mode
-            logging.info("Setting GEOFABRIK_OVERPASS_KEY to simulate production mode")
-            os.environ["GEOFABRIK_OVERPASS_KEY"] = "test_key"
+            # Now simulate production mode by setting CACHE_DIR to None
+            logging.info("Setting CACHE_DIR to None to simulate production mode")
+            enetm.CACHE_DIR = None
             
             # Create a test intercept function to verify the API is called
             api_called = [False]
@@ -497,8 +498,10 @@ class OverpassTest(unittest.TestCase):
                 logging.info("Restored original requests.post function")
         
         finally:
-            # Remove test key and restore original
-            logging.info("Cleaning up environment variables")
+            # Restore original environment
+            enetm.CACHE_DIR = original_cache_dir
+            logging.info(f"Restored original CACHE_DIR")
+            
             if original_key:
                 os.environ["GEOFABRIK_OVERPASS_KEY"] = original_key
             elif "GEOFABRIK_OVERPASS_KEY" in os.environ:
