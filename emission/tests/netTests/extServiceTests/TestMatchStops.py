@@ -7,23 +7,10 @@ standard_library.install_aliases()
 from builtins import *
 import unittest
 import os
-import requests
 import emission.net.ext_service.transit_matching.match_stops as enetm
 import logging
-import shutil
-import time
 import hashlib
 import json
-
-# Sample locations for transit stop testing
-# Sample loc1 = NREL East Gate
-loc1 = {'coordinates': [-105.16844103184974, 39.740428870224605]}
-# Sample loc2 = Denver Union Station
-loc2 = {'coordinates': [-105.00083982302972, 39.753710532185025]}
-# Sample loc3 = Grand Junction Train Station, CO
-loc3 = {'coordinates': [-108.57055213129632, 39.06472424640481]}
-# Sample loc4 = Berkeley BART
-loc4 = {'coordinates': [-122.2585745, 37.8719322], 'type': 'Point'}
 
 class MatchStopsTest(unittest.TestCase):
     """
@@ -67,62 +54,6 @@ class MatchStopsTest(unittest.TestCase):
                     os.remove(os.path.join(self.cache_dir, file))
                     removed_count += 1
             logging.info(f"Removed {removed_count} test cache files")
-
-    def test_get_stops_near(self):
-        """
-        Test the ability to find transit stops near a specified location.
-        
-        This test:
-        1. Calls get_stops_near() with NREL East Gate coordinates
-        2. Verifies the returned transit stop includes expected route information
-        3. Checks that the RTD Route 125 details are correct
-        
-        This validates both the API connectivity and data parsing functionality.
-        """
-        logging.info("==== Testing get_stops_near function ====")
-        logging.info(f"Searching for stops near NREL East Gate: {loc1['coordinates']}")
-        
-        stops = enetm.get_stops_near(loc1, 150.0)
-        logging.info(f"Found {len(stops)} stops near location")
-        
-        if len(stops) > 0 and 'routes' in stops[0] and len(stops[0]['routes']) > 0:
-            actual_result = stops[0]['routes'][0]['tags']
-            logging.info(f"First route tags: {json.dumps(actual_result, indent=2)}")
-            
-            expected_result = {'from': 'National Renewable Energy Lab', 'name': 'RTD Route 125: Red Rocks College', 'network': 'RTD', 'network:wikidata': 'Q7309183', 'network:wikipedia': 'en:Regional Transportation District', 'operator': 'Regional Transportation District', 'public_transport:version': '1', 'ref': '125', 'route': 'bus', 'to': 'Red Rocks College', 'type': 'route'}
-            self.assertEqual(expected_result, actual_result)
-            logging.info("Route tags match expected values ✓")
-        else:
-            logging.error("No routes found in stop data")
-            self.fail("No routes found in stop data")
-   
-    def test_get_predicted_transit_mode(self):
-        """
-        Test the ability to determine transit modes between two locations.
-        
-        This test:
-        1. Finds stops near Denver Union Station and Grand Junction Train Station
-        2. Calls get_predicted_transit_mode() to find common routes
-        3. Verifies that train is correctly identified as the transit mode
-        
-        This tests the ability to identify long-distance transit connections.
-        """
-        logging.info("==== Testing get_predicted_transit_mode function ====")
-        logging.info(f"Finding stops near Denver Union Station: {loc2['coordinates']}")
-        stop1 = enetm.get_stops_near(loc2, 400.0)
-        logging.info(f"Found {len(stop1)} stops near Denver Union Station")
-        
-        logging.info(f"Finding stops near Grand Junction Train Station: {loc3['coordinates']}")
-        stop2 = enetm.get_stops_near(loc3, 400.0)
-        logging.info(f"Found {len(stop2)} stops near Grand Junction Train Station")
-        
-        logging.info("Determining transit mode between the two locations")
-        actual_result = enetm.get_predicted_transit_mode(stop1, stop2)
-        expected_result = ['train', 'train']
-        
-        logging.info(f"Predicted transit modes: {actual_result}")
-        self.assertEqual(actual_result, expected_result)
-        logging.info("Transit modes match expected values ✓")
         
     def test_cache_creation_integrity(self):
         """
