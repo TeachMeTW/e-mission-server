@@ -6,9 +6,6 @@ import itertools
 import os
 import time
 import hashlib
-import pandas as pd
-import pathlib
-import csv
 
 # Set up Overpass API and caching configuration
 CACHE_DIR = None
@@ -133,7 +130,7 @@ def get_public_transit_stops(min_lat, min_lon, max_lat, max_lon):
 
     logging.info(f"after all retries, retry_count = {retry_count}, call_return = {'RETRY' if call_return == RETRY else len(call_return)}...")
     all_results = call_return
-    
+
     relations = [ad.AttrDict(r) for r in all_results if r["type"] == "relation" and r["tags"]["type"] == "route"]
     logging.debug("Found %d relations with ids %s" % (len(relations), [r["id"] for r in relations]))
     stops = [ad.AttrDict(r) for r in all_results if r["type"] != "relation"]

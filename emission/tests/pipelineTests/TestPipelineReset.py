@@ -42,6 +42,7 @@ import emission.tests.common as etc
 class TestPipelineReset(unittest.TestCase):
     def setUp(self):
         np.random.seed(61297777)
+        etc.set_analysis_config("analysis.result.section.key", "analysis/cleaned_section")
 
     def tearDown(self):
         if os.environ.get("SKIP_TEARDOWN", False):
@@ -59,6 +60,7 @@ class TestPipelineReset(unittest.TestCase):
                     self.testUUID = uuid
                     logging.info("Deleting entries for %s" % self.testUUID)
                     self.clearRelatedDb()
+            etc.clear_analysis_config()
 
     def clearRelatedDb(self):
         edb.get_timeseries_db().delete_many({"user_id": self.testUUID})
@@ -112,26 +114,7 @@ class TestPipelineReset(unittest.TestCase):
                     self.assertEqual(rs.type, "FeatureCollection")
                     self.assertEqual(rs.features[0].properties.start_fmt_time, es.features[0].properties.start_fmt_time)
                     self.assertEqual(rs.features[0].properties.end_fmt_time, es.features[0].properties.end_fmt_time)
-                    # Compare only the mode name (e.g., BICYCLING) rather than the full representation
-                    # This handles the switch from PredictedModeTypes to MotionTypes
-                    rs_mode = rs.features[0].properties.sensed_mode.split('.')[-1] if '.' in rs.features[0].properties.sensed_mode else rs.features[0].properties.sensed_mode
-                    es_mode = es.features[0].properties.sensed_mode.split('.')[-1] if '.' in es.features[0].properties.sensed_mode else es.features[0].properties.sensed_mode
-                    
-                    # Handle equivalent motion types (WALKING is equivalent to ON_FOOT)
-                    motion_type_equivalents = {
-                        'WALKING': ['WALKING', 'ON_FOOT'],
-                        'ON_FOOT': ['WALKING', 'ON_FOOT'],
-                        'TRAIN': ['TRAIN', 'IN_VEHICLE', 'SUBWAY'],
-                        'IN_VEHICLE': ['TRAIN', 'IN_VEHICLE', 'SUBWAY'],
-                        'SUBWAY': ['TRAIN', 'IN_VEHICLE', 'SUBWAY']
-                    }
-                    
-                    if rs_mode in motion_type_equivalents and es_mode in motion_type_equivalents[rs_mode]:
-                        # These motion types are considered equivalent, so test passes
-                        pass
-                    else:
-                        self.assertEqual(rs_mode, es_mode)
-                    
+                    self.assertEqual(rs.features[0].properties.sensed_mode, es.features[0].properties.sensed_mode)
                     self.assertEqual(len(rs.features[0].properties.speeds), len(es.features[0].properties.speeds))
                     self.assertEqual(len(rs.features[0].geometry.coordinates), len(es.features[0].geometry.coordinates))
                 logging.debug(20 * "-")
@@ -564,7 +547,9 @@ class TestPipelineReset(unittest.TestCase):
         del(last_place_gt_props["exit_local_dt"])
         del(last_place_gt_props["exit_fmt_time"])
         del(last_place_gt_props["starting_trip"])
-        del(last_place_gt_props["duration"])
+        # Check if duration exists before trying to delete it
+        if "duration" in last_place_gt_props:
+            del(last_place_gt_props["duration"])
         self.assertEqual(len(modified_gt), 3)
 
         # Checking that the modified ground truth is correct
@@ -798,6 +783,9 @@ class TestPipelineReset(unittest.TestCase):
              arrow.get("2022-09-22").shift(hours=-3).int_timestamp]) # user4, only one entry
 
     def testNormalizeWithACursor(self):
+        # Clear any existing records first
+        edb.get_pipeline_state_db().delete_many({})
+        
         invalid_states_mixed = pd.DataFrame({
             "user_id": ["user_1", "user_1", "user_1", "user_2", "user_3", "user_4",
                 "user_5", "user_6"],
@@ -811,17 +799,14 @@ class TestPipelineReset(unittest.TestCase):
         for index, e in invalid_states_mixed.iterrows():
             edb.get_pipeline_state_db().insert_one(e.to_dict())
 
-        # Get the actual count from the database
-        db_count = edb.get_pipeline_state_db().count_documents({})
-        
-        df_from_cursor = pd.json_normalize(edb.get_pipeline_state_db().find())
-        df_from_list = pd.json_normalize(list(edb.get_pipeline_state_db().find()))
+        # Make sure we only get the records we just inserted
+        df_from_cursor = pd.json_normalize(edb.get_pipeline_state_db().find({"user_id": {"$in": self.testUUIDList}}))
+        df_from_list = pd.json_normalize(list(edb.get_pipeline_state_db().find({"user_id": {"$in": self.testUUIDList}})))
 
-        # Check that we got all entries from the database, not that there's a specific number
-        self.assertEqual(len(df_from_cursor), db_count)
+        self.assertEqual(len(df_from_cursor), len(invalid_states_mixed))
 
         # This is the expected behavior in all cases, but let's make sure that it stays as we move through versions of pandas
-        self.assertEqual(len(df_from_list), db_count)
+        self.assertEqual(len(df_from_list), len(invalid_states_mixed))
 
     def testAutoResetMock(self):
         # The expectation is that user_5 and user_6 will be stripped out since:
