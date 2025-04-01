@@ -60,15 +60,8 @@ def get_users_to_check(args):
     if args.user_id:
         return [uuid.UUID(args.user_id)]
     else:
-        # Get all users who have any data
-        users = set()
-        for key in [esda.CLEANED_SECTION_KEY, "analysis/inferred_section"]:
-            collection = edb.get_timeseries_db().find_one({"metadata.key": key})
-            if collection:
-                user_ids = edb.get_timeseries_db().distinct("user_id", {"metadata.key": key})
-                for user_id in user_ids:
-                    users.add(user_id)
-        return list(users)
+        # Get all users from the pipeline state database
+        return [e["user_id"] for e in edb.get_pipeline_state_db().find({})]
 
 def find_problematic_modes(user_id, time_query):
     """
@@ -96,7 +89,10 @@ def find_problematic_modes(user_id, time_query):
     # Build a lookup of inferred sections by cleaned section id
     inferred_by_cleaned = {}
     for section in inferred_sections:
-        if 'cleaned_section' in section.data:
+        # Handle both dictionary and object structures
+        if isinstance(section, dict) and 'data' in section and 'cleaned_section' in section['data']:
+            inferred_by_cleaned[section['data']['cleaned_section']] = section
+        elif hasattr(section, 'data') and hasattr(section.data, 'cleaned_section'):
             inferred_by_cleaned[section.data.cleaned_section] = section
     
     # Check each cleaned section
@@ -115,7 +111,13 @@ def find_problematic_modes(user_id, time_query):
             
         # Case 2: Section has UNKNOWN mode
         inferred = inferred_by_cleaned[section_id]
-        if inferred.data.sensed_mode == ecwm.PredictedModeTypes.UNKNOWN.value:
+        # Handle both dictionary and object structures
+        if isinstance(inferred, dict):
+            sensed_mode = inferred['data']['sensed_mode'] 
+        else:
+            sensed_mode = inferred.data.sensed_mode
+            
+        if sensed_mode == ecwm.PredictedModeTypes.UNKNOWN.value:
             result["unknown_modes"].append({
                 "section_id": str(section_id),
                 "start_time": arrow.get(section.data.start_ts).format("YYYY-MM-DD HH:mm:ss"),
@@ -130,13 +132,20 @@ def find_problematic_modes(user_id, time_query):
     ))
     
     for pred in predictions:
-        for mode, confidence in pred.data.predicted_mode_map.items():
-            if ":" in mode:
-                result["prefixed_modes"].append({
-                    "section_id": str(pred.data.section_id),
-                    "prefixed_mode": mode,
-                    "confidence": confidence
-                })
+        # Handle both dictionary and object structures
+        if isinstance(pred, dict):
+            pred_data = pred['data']
+        else:
+            pred_data = pred.data
+            
+        if 'predicted_mode_map' in pred_data:
+            for mode, confidence in pred_data['predicted_mode_map'].items():
+                if ":" in mode:
+                    result["prefixed_modes"].append({
+                        "section_id": str(pred_data['section_id']) if 'section_id' in pred_data else "unknown",
+                        "prefixed_mode": mode,
+                        "confidence": confidence
+                    })
     
     # Only return results if there are any problems
     if (len(result["unknown_modes"]) == 0 and 
@@ -145,7 +154,6 @@ def find_problematic_modes(user_id, time_query):
         return None
     
     return result
-
 def main():
     args = parse_args()
     
