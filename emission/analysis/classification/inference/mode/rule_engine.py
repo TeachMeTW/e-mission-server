@@ -68,10 +68,17 @@ class RuleEngineModeInferencePipeline:
                 (section_entry.get_id(),
                  section_entry.data.start_fmt_time, section_entry.data.end_fmt_time) +
                 '~' * 10)
-            if section_entry.data.sensed_mode == ecwma.MotionTypes.AIR_OR_HSR:
-                predictedProb.append({'AIR_OR_HSR': 1})
-            else:
-                predictedProb.append(get_prediction(i, section_entry))
+            try:
+                if section_entry.data.sensed_mode == ecwma.MotionTypes.AIR_OR_HSR:
+                    predictedProb.append({'AIR_OR_HSR': 1})
+                else:
+                    predictedProb.append(get_prediction(i, section_entry))
+            except Exception as e:
+                logging.error(f"Error while inferring mode for section {section_entry.get_id()} for user {section_entry.user_id}, starting at {section_entry.data.start_fmt_time}")
+                logging.exception(e)
+                # Add a default prediction that won't affect downstream processing
+                # Using UNKNOWN as the mode type for this section
+                predictedProb.append({'UNKNOWN': 1})
 
         return predictedProb
 
@@ -198,12 +205,25 @@ def collapse_modes(section_entry, modes):
     if modes is None or len(modes) == 0:
         return None
 
+    # Handle suspended routes
     modes_no_suspend = [m.replace(":suspended", "").replace(":SUSPENDED", "")
                             for m in modes]
+    
+    # Handle modes with prefixes (like XMAS:TRAIN)
+    # If the mode contains a colon, extract the last part (base mode)
+    clean_modes = []
+    for mode in modes_no_suspend:
+        if ":" in mode:
+            # Extract the base mode after the colon
+            base_mode = mode.split(":")[-1]
+            logging.debug(f"Converting prefixed mode {mode} to base mode {base_mode}")
+            clean_modes.append(base_mode)
+        else:
+            clean_modes.append(mode)
 
     # map all train-like modes to train
     map_train = lambda m: 'TRAIN' if m in train_mode_list else m.upper()
-    train_mapped_modes = list(map(map_train, modes_no_suspend))
+    train_mapped_modes = list(map(map_train, clean_modes))
 
     logging.debug("train_mapped_modes = %s" % train_mapped_modes)
 

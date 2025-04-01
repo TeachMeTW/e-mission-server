@@ -542,6 +542,59 @@ class TestRuleEngine(unittest.TestCase):
         self.assertEqual(mock_get_stops_near.call_count, 2)
         self.assertEqual(mock_get_predicted_transit_mode.call_count, 1)
 
+    @patch('emission.net.ext_service.transit_matching.match_stops.get_stops_near')
+    @patch('emission.net.ext_service.transit_matching.match_stops.get_predicted_transit_mode')
+    def testPrefixedTransitMode(self, mock_get_predicted_transit_mode, mock_get_stops_near):
+        """
+        Test handling of prefixed transit modes like "XMAS:TRAIN".
+        
+        This test:
+        1. Mocks the transit stop detection to return train stops with a prefixed mode
+        2. Creates an IN_VEHICLE section
+        3. Verifies that the rule engine correctly extracts the base mode (TRAIN)
+           and uses it for inference
+        
+        This tests the system's ability to handle non-standard OSM route tags
+        that contain prefixes, like seasonal routes.
+        """
+        # First reset any pipeline state
+        epr.reset_curr_run_state(self.testUUID, False)
+        
+        # Mock transit stop data with prefixed mode
+        mock_get_stops_near.return_value = ['holiday_train_stop1', 'holiday_train_stop2']
+        mock_get_predicted_transit_mode.return_value = ['XMAS:TRAIN']
+        
+        section_entry = self.create_test_section(ecwma.MotionTypes.IN_VEHICLE.value)
+        
+        # Run rule engine
+        rule_engine.predict_mode(self.testUUID)
+        
+        # Check prediction
+        predictions = self.ts.find_entries(["inference/prediction"])
+        self.assertEqual(len(predictions), 1)
+        
+        # Entries returned by find_entries are already dictionaries
+        prediction_dict = predictions[0]
+        self.assertEqual(prediction_dict["data"]["predicted_mode_map"], {'TRAIN': 1})
+        
+        # Check inferred section
+        inferred_sections = self.ts.find_entries(["analysis/inferred_section"])
+        self.assertEqual(len(inferred_sections), 1)
+        self.assertEqual(inferred_sections[0]["data"]["sensed_mode"], ecwm.PredictedModeTypes.TRAIN.value)
+        
+        # Print results for debugging with prefixed mode info
+        expected_mode = "TRAIN"
+        logging.info("===== PREFIXED TRANSIT MODE RESULTS =====")
+        logging.info(f"Nearby stops: {mock_get_stops_near.return_value}")
+        logging.info(f"Predicted transit mode with prefix: {mock_get_predicted_transit_mode.return_value}")
+        inferred_mode = self.print_prediction_results(section_entry, prediction_dict, inferred_sections[0], 
+                                                     "PREFIXED MODE", expected_mode)
+        self.assertEqual(inferred_mode, expected_mode)
+        
+        # Verify our mocks were called as expected
+        self.assertEqual(mock_get_stops_near.call_count, 2)
+        self.assertEqual(mock_get_predicted_transit_mode.call_count, 1)
+
     def testUnknownMode(self):
         """
         Test that UNKNOWN sensed mode is handled properly.
@@ -658,6 +711,69 @@ class TestRuleEngine(unittest.TestCase):
         total_count = len(all_results)
         logging.info(f"Correct predictions: {correct_count}/{total_count} ({correct_count/total_count*100:.1f}%)")
         logging.info("===========================================")
+
+    @patch('emission.net.ext_service.transit_matching.match_stops.get_stops_near')
+    @patch('emission.net.ext_service.transit_matching.match_stops.get_predicted_transit_mode')
+    def testErrorHandlingDuringInference(self, mock_get_predicted_transit_mode, mock_get_stops_near):
+        """
+        Test error handling during mode inference.
+        
+        This test:
+        1. Creates two sections for testing
+        2. Configures the transit mode prediction to raise an exception for one section
+        3. Verifies that the pipeline continues processing the other section
+           instead of failing completely
+        
+        This tests the system's ability to handle errors gracefully and
+        continue processing other sections when one section fails.
+        """
+        # First reset any pipeline state
+        epr.reset_curr_run_state(self.testUUID, False)
+        
+        # Create two test sections
+        section1 = self.create_test_section(ecwma.MotionTypes.IN_VEHICLE.value)
+        section2 = self.create_test_section(ecwma.MotionTypes.IN_VEHICLE.value)
+        
+        # Configure mock to raise exception for the first call but return normally for second call
+        side_effects = [
+            # First call - raise an exception
+            Exception("Test error to simulate failure with unsupported transit mode"),
+            # Second call - normal return
+            ['TRAIN']
+        ]
+        mock_get_predicted_transit_mode.side_effect = side_effects
+        mock_get_stops_near.return_value = ['stop1', 'stop2']
+        
+        # Run rule engine
+        rule_engine.predict_mode(self.testUUID)
+        
+        # Check predictions - we should have two, one for each section
+        predictions = self.ts.find_entries(["inference/prediction"])
+        self.assertEqual(len(predictions), 2)
+        
+        # First prediction should be for UNKNOWN due to error
+        self.assertEqual(predictions[0]["data"]["predicted_mode_map"], {'UNKNOWN': 1})
+        
+        # Second prediction should be normal
+        self.assertEqual(predictions[1]["data"]["predicted_mode_map"], {'TRAIN': 1})
+        
+        # Check inferred sections - should have two sections
+        inferred_sections = self.ts.find_entries(["analysis/inferred_section"])
+        self.assertEqual(len(inferred_sections), 2)
+        
+        # Print results
+        logging.info("===== ERROR HANDLING DURING INFERENCE RESULTS =====")
+        logging.info("First section (error case):")
+        logging.info(f"Predicted mode map: {predictions[0]['data']['predicted_mode_map']}")
+        logging.info(f"Inferred mode: {ecwm.PredictedModeTypes(inferred_sections[0]['data']['sensed_mode']).name}")
+        
+        logging.info("Second section (normal case):")
+        logging.info(f"Predicted mode map: {predictions[1]['data']['predicted_mode_map']}")
+        logging.info(f"Inferred mode: {ecwm.PredictedModeTypes(inferred_sections[1]['data']['sensed_mode']).name}")
+        
+        # Verify our mocks were called the expected number of times
+        self.assertEqual(mock_get_stops_near.call_count, 4)  # 2 per section (start and end)
+        self.assertEqual(mock_get_predicted_transit_mode.call_count, 2)  # Once per section
 
 if __name__ == "__main__":
     # Setup logging with timestamp and level for better debugging
