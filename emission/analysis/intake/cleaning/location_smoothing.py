@@ -56,48 +56,20 @@ def recalc_speed(points_df):
     The speed column has the speed between each point and its previous point.
     The first row has a speed of zero.
     Uses vectorized numpy operations for better performance.
-    """
-    from emission.core.common import haversine_numpy
     
+    This is a wrapper around add_dist_heading_speed for backward compatibility.
+    https://github.com/e-mission/e-mission-server/pull/1048#discussion_r2050693860
+    """
+    # First, drop the existing speed and distance columns
     stripped_df = points_df.drop("speed", axis=1).drop("distance", axis=1)
     
-    if len(stripped_df) <= 1:
-        # Handle empty or single-point dataframes
-        distances = np.zeros(len(stripped_df))
-        speeds = np.zeros(len(stripped_df))
-    else:
-        # Extract coordinates and timestamps
-        lons = stripped_df['longitude'].to_numpy()
-        lats = stripped_df['latitude'].to_numpy()
-        
-        # Calculate distance using haversine_numpy
-        distances = np.zeros(len(stripped_df))
-        distances[1:] = haversine_numpy(
-            lons[:-1], lats[:-1],
-            lons[1:], lats[1:]
-        )
-        
-        # Calculate time differences
-        timestamps = stripped_df['ts'].to_numpy()
-        time_diffs = np.zeros(len(stripped_df))
-        time_diffs[1:] = timestamps[1:] - timestamps[:-1]
-        
-        # Calculate speeds
-        speeds = np.zeros(len(stripped_df))
-        # Avoid division by zero
-        mask = time_diffs > 0
-        speeds[mask] = distances[mask] / time_diffs[mask]
-    
-    # Add calculated columns to dataframe
-    with_speeds_df = pd.concat([stripped_df, pd.Series(distances, index=stripped_df.index, name="distance")], axis=1)
-    with_speeds_df = pd.concat([with_speeds_df, pd.Series(speeds, index=stripped_df.index, name="speed")], axis=1)
-    
-    return with_speeds_df
+    # Call add_dist_heading_speed with add_heading=False
+    return add_dist_heading_speed(stripped_df, add_heading=False)
 
-def add_dist_heading_speed(points_df):
-    # type: (pandas.DataFrame) -> pandas.DataFrame
+def add_dist_heading_speed(points_df, add_heading=True):
+    # type: (pandas.DataFrame, bool) -> pandas.DataFrame
     """
-    Returns a new dataframe with added "distance", "speed", and "heading" columns.
+    Returns a new dataframe with added "distance", "speed", and optionally "heading" columns.
     Uses vectorized numpy operations for better performance.
     
     The distance, speed, and heading columns have values between each point and its previous point.
@@ -109,7 +81,7 @@ def add_dist_heading_speed(points_df):
         # Handle empty or single-point dataframes
         distances = np.zeros(len(points_df))
         speeds = np.zeros(len(points_df))
-        headings = np.zeros(len(points_df))
+        headings = np.zeros(len(points_df)) if add_heading else None
     else:
         # Extract coordinates and timestamps
         lons = points_df['longitude'].to_numpy()
@@ -133,20 +105,27 @@ def add_dist_heading_speed(points_df):
         mask = time_diffs > 0
         speeds[mask] = distances[mask] / time_diffs[mask]
         
-        # Calculate headings
-        headings = np.zeros(len(points_df))
-        headings[1:] = calHeading_numpy(
-            lons[:-1], lats[:-1],
-            lons[1:], lats[1:]
-        )
+        # Calculate headings if requested
+        if add_heading:
+            headings = np.zeros(len(points_df))
+            headings[1:] = calHeading_numpy(
+                lons[:-1], lats[:-1],
+                lons[1:], lats[1:]
+            )
+        else:
+            headings = None
     
     # Add calculated columns to dataframe
-    with_distances_df = pd.concat([points_df, pd.Series(distances, name="distance")], axis=1)
-    with_speeds_df = pd.concat([with_distances_df, pd.Series(speeds, name="speed")], axis=1)
-    if "heading" in with_speeds_df.columns:
-        with_speeds_df.drop("heading", axis=1, inplace=True)
-    with_headings_df = pd.concat([with_speeds_df, pd.Series(headings, name="heading")], axis=1)
-    return with_headings_df
+    with_distances_df = pd.concat([points_df, pd.Series(distances, index=points_df.index, name="distance")], axis=1)
+    with_speeds_df = pd.concat([with_distances_df, pd.Series(speeds, index=points_df.index, name="speed")], axis=1)
+    
+    if add_heading:
+        # Add heading column
+        if "heading" in with_speeds_df.columns:
+            with_speeds_df.drop("heading", axis=1, inplace=True)
+        with_speeds_df = pd.concat([with_speeds_df, pd.Series(headings, index=points_df.index, name="heading")], axis=1)
+        
+    return with_speeds_df
 
 def add_heading_change(points_df):
     """
