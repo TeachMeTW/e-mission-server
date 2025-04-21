@@ -40,13 +40,59 @@ def travel_date_time(time1,time2):
     travel_time = time2-time1
     return travel_time.seconds
 
-def haversine_numpy(lon1, lat1, lon2, lat2):
+def haversine_numpy(lon1, lat1, lon2=None, lat2=None, coordinates=False):
     """
     Haversine distance using 'numpy'
-    :return distance in meters
+    Fully vectorized implementation for optimal performance.
+    
+    Usage options:
+    1. haversine_numpy(lon1, lat1, lon2, lat2) - vectorized calculation with arrays
+    2. haversine_numpy(point1, point2, coordinates=False) - single points in geojson format [lon, lat]
+    3. haversine_numpy(point1, point2, coordinates=True) - single points with .lon/.lat attributes
+    
+    :return: distance in meters
     """
     earth_radius = 6371000
-
+    
+    # Extract coordinates from different input formats
+    if lon2 is None:
+        # This is the calDistance(point1, point2) format
+        point1, point2 = lon1, lat1
+        
+        if coordinates:
+            # Points have .lat and .lon attributes
+            try:
+                lat1 = np.array([float(point1.lat)])
+                lon1 = np.array([float(point1.lon)])
+                lat2 = np.array([float(point2.lat)])
+                lon2 = np.array([float(point2.lon)])
+            except AttributeError:
+                raise ValueError("When coordinates=True, points must have .lat and .lon attributes")
+        else:
+            # Points are in geojson format [lon, lat]
+            try:
+                lon1 = np.array([float(point1[0])])
+                lat1 = np.array([float(point1[1])])
+                lon2 = np.array([float(point2[0])])
+                lat2 = np.array([float(point2[1])])
+            except (IndexError, TypeError):
+                raise ValueError("When coordinates=False, points must be [lon, lat] format")
+        
+        single_point = True
+    else:
+        # Ensure all inputs are numpy arrays for vectorized operations
+        if not isinstance(lon1, np.ndarray):
+            lon1 = np.array(lon1)
+        if not isinstance(lat1, np.ndarray):
+            lat1 = np.array(lat1)
+        if not isinstance(lon2, np.ndarray):
+            lon2 = np.array(lon2)
+        if not isinstance(lat2, np.ndarray):
+            lat2 = np.array(lat2)
+        
+        single_point = False
+    
+    # Vectorized calculation
     lat1, lat2 = np.radians(lat1), np.radians(lat2)
     lon1, lon2 = np.radians(lon1), np.radians(lon2)
 
@@ -54,7 +100,13 @@ def haversine_numpy(lon1, lat1, lon2, lat2):
     dlon = lon2 - lon1
 
     a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    return 2 * earth_radius * np.arcsin(np.sqrt(a))
+    distances = 2 * earth_radius * np.arcsin(np.sqrt(a))
+    
+    # Return scalar for single point calculations, array otherwise
+    if single_point:
+        return float(distances[0])
+    else:
+        return distances
 
 def calHeading_numpy(lon1, lat1, lon2, lat2):
     """
@@ -62,6 +114,16 @@ def calHeading_numpy(lon1, lat1, lon2, lat2):
     Points are expected to be in longitude, latitude form (WGS84)
     :return heading in degrees, from -180 to 180
     """
+    # Ensure all inputs are numpy arrays
+    if not isinstance(lon1, np.ndarray):
+        lon1 = np.array(lon1)
+    if not isinstance(lat1, np.ndarray):
+        lat1 = np.array(lat1)
+    if not isinstance(lon2, np.ndarray):
+        lon2 = np.array(lon2)
+    if not isinstance(lat2, np.ndarray):
+        lat2 = np.array(lat2)
+    
     lat1, lat2 = np.radians(lat1), np.radians(lat2)
     lon1, lon2 = np.radians(lon1), np.radians(lon2)
     
@@ -78,27 +140,9 @@ def calDistance(point1, point2, coordinates=False):
     :param coordinates: if false, expect a list of coordinates, defaults to False
     :return: distance approximately in meters
     """
-    earthRadius = 6371000  # meters
-    # SHANKARI: Why do we have two calDistance() functions?
-    # Need to combine into one
-    # points are now in geojson format (lng,lat)
-    if coordinates:
-        dLat = math.radians(point1.lat-point2.lat)
-        dLon = math.radians(point1.lon-point2.lon)
-        lat1 = math.radians(point1.lat)
-        lat2 = math.radians(point2.lat)
-    else:
-        dLat = math.radians(point1[1]-point2[1])
-        dLon = math.radians(point1[0]-point2[0])
-        lat1 = math.radians(point1[1])
-        lat2 = math.radians(point2[1])
-
-
-    a = (math.sin(dLat/2) ** 2) + ((math.sin(dLon/2) ** 2) * math.cos(lat1) * math.cos(lat2))
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    d = earthRadius * c
-
-    return d
+    # This function is maintained for backward compatibility
+    # Use haversine_numpy instead for new code
+    return haversine_numpy(point1, point2, coordinates=coordinates)
 
 def compare_rounded_arrays(arr1, arr2, digits):
     round2n = lambda x: round(x, digits)
