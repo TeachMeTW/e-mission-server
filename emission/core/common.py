@@ -40,111 +40,102 @@ def travel_date_time(time1,time2):
     travel_time = time2-time1
     return travel_time.seconds
 
-def haversine_numpy(lon1, lat1, lon2=None, lat2=None, coordinates=False):
+def haversine_numpy(lon1, lat1, lon2, lat2):
     """
-    Haversine distance using 'numpy'
-    Fully vectorized implementation for optimal performance.
+    Calculate the great circle distance between points
+    using numpy for vectorized calculations.
     
-    Usage options:
-    1. haversine_numpy(lon1, lat1, lon2, lat2) - vectorized calculation with arrays
-    2. haversine_numpy(point1, point2, coordinates=False) - single points in geojson format [lon, lat]
-    3. haversine_numpy(point1, point2, coordinates=True) - single points with .lon/.lat attributes
-    
-    :return: distance in meters
+    :param lon1: Longitude of first point(s) in decimal degrees
+    :param lat1: Latitude of first point(s) in decimal degrees
+    :param lon2: Longitude of second point(s) in decimal degrees
+    :param lat2: Latitude of second point(s) in decimal degrees
+    :return: Distance in meters
     """
-    earth_radius = 6371000
+    earth_radius = 6371000  # meters
     
-    # Extract coordinates from different input formats
-    if lon2 is None:
-        # This is the calDistance(point1, point2) format
-        point1, point2 = lon1, lat1
-        
-        if coordinates:
-            # Points have .lat and .lon attributes
-            try:
-                lat1 = np.array([float(point1.lat)])
-                lon1 = np.array([float(point1.lon)])
-                lat2 = np.array([float(point2.lat)])
-                lon2 = np.array([float(point2.lon)])
-            except AttributeError:
-                raise ValueError("When coordinates=True, points must have .lat and .lon attributes")
-        else:
-            # Points are in geojson format [lon, lat]
-            try:
-                lon1 = np.array([float(point1[0])])
-                lat1 = np.array([float(point1[1])])
-                lon2 = np.array([float(point2[0])])
-                lat2 = np.array([float(point2[1])])
-            except (IndexError, TypeError):
-                raise ValueError("When coordinates=False, points must be [lon, lat] format")
-        
-        single_point = True
-    else:
-        # Ensure all inputs are numpy arrays for vectorized operations
-        if not isinstance(lon1, np.ndarray):
-            lon1 = np.array(lon1)
-        if not isinstance(lat1, np.ndarray):
-            lat1 = np.array(lat1)
-        if not isinstance(lon2, np.ndarray):
-            lon2 = np.array(lon2)
-        if not isinstance(lat2, np.ndarray):
-            lat2 = np.array(lat2)
-        
-        single_point = False
+    # Convert decimal degrees to radians
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
     
-    # Vectorized calculation
-    lat1, lat2 = np.radians(lat1), np.radians(lat2)
-    lon1, lon2 = np.radians(lon1), np.radians(lon2)
-
-    dlat = lat2 - lat1
+    # Haversine formula
     dlon = lon2 - lon1
-
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    distances = 2 * earth_radius * np.arcsin(np.sqrt(a))
+    dlat = lat2 - lat1
     
-    # Return scalar for single point calculations, array otherwise
-    if single_point:
-        return float(distances[0])
-    else:
-        return distances
-
-def calHeading_numpy(lon1, lat1, lon2, lat2):
-    """
-    Calculate heading angle using numpy with identical results to calHeading.
-    Points are expected to be in longitude, latitude form (WGS84)
-    :return heading in degrees, from -180 to 180
-    """
-    # Ensure all inputs are numpy arrays
-    if not isinstance(lon1, np.ndarray):
-        lon1 = np.array(lon1)
-    if not isinstance(lat1, np.ndarray):
-        lat1 = np.array(lat1)
-    if not isinstance(lon2, np.ndarray):
-        lon2 = np.array(lon2)
-    if not isinstance(lat2, np.ndarray):
-        lat2 = np.array(lat2)
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    distance = earth_radius * c
     
-    lat1, lat2 = np.radians(lat1), np.radians(lat2)
-    lon1, lon2 = np.radians(lon1), np.radians(lon2)
-    
-    y = np.sin(lon2 - lon1) * np.cos(lat2)
-    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(lon2 - lon1)
-    
-    return np.degrees(np.arctan2(y, x))
+    return distance
 
 def calDistance(point1, point2, coordinates=False):
-    """haversine distance
-
-    :param point1: a coordinate in degrees WGS84
-    :param point2: another coordinate in degrees WGS84
-    :param coordinates: if false, expect a list of coordinates, defaults to False
-    :return: distance approximately in meters
     """
-    # This function is maintained for backward compatibility
-    # Use haversine_numpy instead for new code
-    return haversine_numpy(point1, point2, coordinates=coordinates)
+    Calculate the great circle distance between two points 
+    on the earth (specified in decimal degrees)
+    
+    :param point1: Point in [longitude, latitude] format or object with .lon and .lat attributes
+    :param point2: Point in [longitude, latitude] format or object with .lon and .lat attributes
+    :param coordinates: If True, points are objects with .lon and .lat attributes. 
+                        If False, points are [lon, lat] lists
+    :return: Distance in meters
+    """
+    # Extract coordinates based on the input format
+    if coordinates:
+        lon1, lat1 = point1.lon, point1.lat
+        lon2, lat2 = point2.lon, point2.lat
+    else:
+        lon1, lat1 = point1[0], point1[1]
+        lon2, lat2 = point2[0], point2[1]
+    
+    # Use vectorized function for the calculation
+    return haversine_numpy(lon1, lat1, lon2, lat2)
 
 def compare_rounded_arrays(arr1, arr2, digits):
     round2n = lambda x: round(x, digits)
     return list(map(round2n, arr1)) == list(map(round2n, arr2))
+
+def calHeading(point1, point2, coordinates=False):
+    """
+    Calculate the heading angle between two points on the earth 
+    (specified in decimal degrees)
+    
+    :param point1: Point in [longitude, latitude] format or object with .lon and .lat attributes
+    :param point2: Point in [longitude, latitude] format or object with .lon and .lat attributes
+    :param coordinates: If True, points are objects with .lon and .lat attributes.
+                        If False, points are [lon, lat] lists
+    :return: Heading angle in degrees (0-360)
+    """
+    # Extract coordinates based on the input format
+    if coordinates:
+        lon1, lat1 = point1.lon, point1.lat
+        lon2, lat2 = point2.lon, point2.lat
+    else:
+        lon1, lat1 = point1[0], point1[1]
+        lon2, lat2 = point2[0], point2[1]
+    
+    # Use calHeading_numpy for the calculation
+    return calHeading_numpy(lon1, lat1, lon2, lat2)
+
+def calHeading_numpy(lon1, lat1, lon2, lat2):
+    """
+    Calculate the heading angle between two points
+    using numpy for vectorized calculations.
+    
+    :param lon1: Longitude of first point(s) in decimal degrees
+    :param lat1: Latitude of first point(s) in decimal degrees
+    :param lon2: Longitude of second point(s) in decimal degrees
+    :param lat2: Latitude of second point(s) in decimal degrees
+    :return: Heading angle in degrees (0-360)
+    """
+    # Convert decimal degrees to radians
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    
+    # Calculate heading
+    dlon = lon2 - lon1
+    x = np.sin(dlon) * np.cos(lat2)
+    y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
+    
+    # Convert to degrees and normalize to 0-360
+    heading = np.degrees(np.arctan2(x, y))
+    heading = (heading + 360) % 360
+    
+    return heading
 
